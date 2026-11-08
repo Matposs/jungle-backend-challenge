@@ -37,6 +37,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 | 12 | Consumidor SQS, Inbox transacional, redelivery, DLQ e shutdown |
 | 13 | Publicador Outbox concorrente, retry persistente e recuperação após falha |
 | 14 | Worker de referências pendentes com retry persistente, TTL e desfecho transacional |
+| 15 | Consultas HTTP de wallet, ledger paginado e transações por ID interno ou identidade do provedor |
 
 ## Fluxos e garantias atuais
 
@@ -46,6 +47,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 - **SQS e Inbox.** `wager-transactions.fifo` usa redrive para `wager-transactions-dlq.fifo` após cinco recebimentos. O consumidor reutiliza `SubmitWager`. A chave `(consumer_name, message_id)`, o hash do envelope e a conclusão ficam na mesma transação dos efeitos. O ACK ocorre depois do commit, inclusive para rejeições persistidas e referências pendentes. Falhas transitórias usam backoff de visibilidade e falhas permanentes seguem para a DLQ.
 - **Outbox.** O publicador lê eventos confirmados com `FOR UPDATE SKIP LOCKED`, seleciona o primeiro evento por agregado e publica o envelope em `wagering-events.fifo`. São emitidos `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference` e `WalletBalanceChanged` conforme o resultado. O publicador grava sucesso após o ACK do broker e persiste os retries. `aggregateId` ordena o grupo e `eventId` é estável para deduplicação.
 - **Referências pendentes.** O worker reavalia `WIN`, `REFUND` e `ROLLBACK` sob lock da wallet, com retry persistente de 5 segundos a 5 minutos e prazo de 24 horas. O desfecho fica na operação original e é publicado pela Outbox.
+- **Consultas HTTP.** Os quatro GETs do README §9 leem dados confirmados no PostgreSQL. O ledger usa cursor assinado, vinculado à wallet, e o DTO da transação distingue o saldo observado do saldo atual. A inicialização HTTP exige `LEDGER_CURSOR_SECRET` com 64 caracteres hexadecimais. Use o mesmo valor em todas as instâncias. Falhas transitórias conhecidas de conexão e do pool geram `503`.
 
 ## Execução e validação
 
@@ -72,9 +74,11 @@ A validação do checkpoint do Bloco 13 obteve 137 aprovações em 10 arquivos, 
 
 O Bloco 14 acrescentou 13 testes de integração com PostgreSQL. A suíte completa passou com 150 testes em 11 arquivos, incluindo os cenários com LocalStack. Os testes do worker cobrem resolução tardia, cadeias, retry, fronteira do TTL, ordem de seleção sob backlog, concorrência, progresso entre ciclos com falha persistente, retomada após falha no commit, replay terminal, consistência do ledger e ordem do desfecho na Outbox.
 
+O Bloco 15 acrescentou 13 testes, 11 de integração HTTP com PostgreSQL e dois de inicialização do processo HTTP. A suíte completa passou com 163 testes em 12 arquivos, incluindo os cenários com LocalStack. Os testes cobrem as quatro rotas, estados e precisão monetária, isolamento de wallet e provedor, paginação e assinatura do cursor, ausência de efeitos colaterais, rejeição de chave ausente ou inválida, continuidade de página entre instâncias e recuperação de uma desconexão do PostgreSQL sem SQLSTATE.
+
 ## Pendências e ordem de retomada
 
-1. **Consultas HTTP e reconciliação.** Implemente `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger` com cursor estável e opaco, `GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId`. Implemente `POST /wallets/:walletId/reconciliation` com leitura consistente do saldo e do ledger, resposta da divergência, log e métrica. O contrato exige preservar os dados e sinalizar diferenças para análise.
+1. **Reconciliação.** Implemente `POST /wallets/:walletId/reconciliation` com leitura consistente do saldo e do ledger, resposta da divergência, log e métrica. O contrato exige preservar os dados e sinalizar diferenças para análise.
 2. **Readiness e observabilidade.** Falta `GET /health/ready` com PostgreSQL e SQS, além das métricas oficiais de status, duplicatas, retries, DLQ, conflitos de lock, atraso da Outbox e latência. Consumidor e publisher já emitem logs JSON. Falta completar a correlação entre os transportes e os fluxos financeiros, mantendo payloads completos e segredos fora dos logs.
 3. **Validação e entrega.** Complete a matriz do README, incluindo um cenário automatizado que mate o consumidor entre commit e ACK e reinicie em processo independente. A suíte atual valida a mesma fronteira com falha de ACK injetada e redelivery real. Verifique o saldo reconstruído pelo ledger nas novas suítes. Finalize setup, comandos e evidências de entrega. Se mantida a decisão de omitir autenticação, documente o desenho e explicite o ponto de extensão conforme o README §2.
 

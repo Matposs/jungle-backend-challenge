@@ -1,16 +1,30 @@
 import {
-  BadRequestException, Body, ConflictException, Controller, Headers, HttpCode, Inject, Post,
-  HttpStatus, Res, ServiceUnavailableException, UnprocessableEntityException,
+  BadRequestException, Body, ConflictException, Controller, Get, Headers, HttpCode, Inject, Param, Post,
+  HttpStatus, Res, ServiceUnavailableException, UnprocessableEntityException, UseGuards,
 } from '@nestjs/common';
+import { FinancialQueries } from '../../application/financial-queries.js';
 import {
   DuplicateReversalError, InvalidWagerInputError, SubmitWager, WagerIdentityConflictError, WagerUnavailableError,
 } from '../../application/submit-wager.js';
 import { parseWager } from '../../application/parse-wager.js';
 import { WagerTransactionStatus } from '../../domain/wager-transaction.js';
+import { FinancialQueryAccessGuard } from './financial-query-access.guard.js';
+import { queryId, requireQueryResult, transactionResponse } from './financial-query-contracts.js';
 
 @Controller('wagering/transactions')
 export class WageringController {
-  constructor(@Inject(SubmitWager) private readonly submitWager: SubmitWager) {}
+  constructor(
+    @Inject(SubmitWager) private readonly submitWager: SubmitWager,
+    @Inject(FinancialQueries) private readonly queries: FinancialQueries,
+  ) {}
+
+  @Get(':transactionId')
+  @UseGuards(FinancialQueryAccessGuard)
+  async getTransaction(@Param('transactionId') transactionId: string) {
+    const id = queryId(transactionId, 'transactionId');
+    const transaction = await requireQueryResult(() => this.queries.transaction(id), 'Transaction not found.');
+    return transactionResponse(transaction);
+  }
 
   @Post()
   @HttpCode(200)

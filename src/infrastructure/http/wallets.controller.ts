@@ -1,6 +1,9 @@
-import { BadRequestException, Body, ConflictException, Controller, Inject, Post } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { FinancialQueries } from '../../application/financial-queries.js';
 import { OpenWallet, WalletAlreadyExistsError } from '../../application/open-wallet.js';
 import { Money, MoneyError, type MoneyProps } from '../../domain/money.js';
+import { FinancialQueryAccessGuard } from './financial-query-access.guard.js';
+import { decodeLedgerCursor, encodeLedgerCursor, ledgerEntryResponse, ledgerLimit, queryId, requireQueryResult, walletResponse } from './financial-query-contracts.js';
 
 function parseOpeningRequest(body: unknown): { playerId: string; initialBalance: Money } {
   if (body === null || typeof body !== 'object' || !('playerId' in body) ||
@@ -27,7 +30,35 @@ function parseOpeningRequest(body: unknown): { playerId: string; initialBalance:
 
 @Controller('wallets')
 export class WalletsController {
-  constructor(@Inject(OpenWallet) private readonly openWallet: OpenWallet) {}
+  constructor(
+    @Inject(OpenWallet) private readonly openWallet: OpenWallet,
+    @Inject(FinancialQueries) private readonly queries: FinancialQueries,
+  ) {}
+
+  @Get(':walletId')
+  @UseGuards(FinancialQueryAccessGuard)
+  async getWallet(@Param('walletId') walletId: string) {
+    const id = queryId(walletId, 'walletId');
+    const wallet = await requireQueryResult(() => this.queries.wallet(id), 'Wallet not found.');
+    return walletResponse(wallet);
+  }
+
+  @Get(':walletId/ledger')
+  @UseGuards(FinancialQueryAccessGuard)
+  async getLedger(
+    @Param('walletId') walletId: string,
+    @Query('limit') rawLimit: unknown,
+    @Query('cursor') cursor: unknown,
+  ) {
+    const id = queryId(walletId, 'walletId');
+    const limit = ledgerLimit(rawLimit);
+    const afterId = decodeLedgerCursor(cursor, id);
+    const page = await requireQueryResult(() => this.queries.ledger(id, limit, afterId), 'Wallet not found.');
+    return {
+      items: page.items.map(ledgerEntryResponse),
+      nextCursor: page.nextEntryId === undefined ? null : encodeLedgerCursor(id, page.nextEntryId),
+    };
+  }
 
   @Post()
   async open(@Body() body: unknown): Promise<{ id: string; playerId: string; balance: MoneyProps; version: number }> {
@@ -35,7 +66,7 @@ export class WalletsController {
 
     try {
       const wallet = await this.openWallet.execute(playerId, initialBalance);
-      return { id: wallet.id, playerId: wallet.playerId, balance: wallet.balance.toJSON(), version: wallet.version };
+      return walletResponse(wallet);
     } catch (error) {
       if (error instanceof WalletAlreadyExistsError) throw new ConflictException(error.message);
       throw error;

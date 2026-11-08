@@ -114,3 +114,22 @@ O prazo de 24 horas parte de `created_at` e limita o próximo agendamento. A ava
 O schema registra a hora da decisão financeira. O instante em que o commit tornou essa decisão visível não está disponível nesses dados. Assim, uma referência válida pode ser rejeitada mesmo que tenha chegado a tempo, se o worker só conseguir avaliar a pendência no limite ou depois dele.
 
 Retries pendentes atualizam apenas o contador e o horário. A decisão terminal atualiza a transação original, grava o saldo observado e enfileira o evento de desfecho, com atualização da wallet e entrada no ledger quando aplicável. O evento de pendência conserva sua posição anterior à do desfecho no mesmo agregado. O replay conserva a identidade e devolve o estado terminal e o saldo gravados.
+
+## Consultas HTTP
+
+Os quatro endpoints de consulta usam a mesma porta de leitura, com um adaptador PostgreSQL que executa consultas parametrizadas. O saldo da wallet vem do saldo materializado. O ledger usa o índice `(wallet_id, created_at, id)` e as transações usam o ID interno ou a chave única `(provider_id, external_transaction_id)`. As leituras veem dados confirmados e dispensam locks de escrita. Os DTOs usam `{ amount, currency }` com valores decimais de duas casas em strings e datas ISO 8601. Chaves de idempotência, hashes e controles de retry ficam na persistência.
+
+| Rota | Resposta 200 |
+| --- | --- |
+| `GET /wallets/:walletId` | `id`, `playerId`, `balance` e `version` |
+| `GET /wallets/:walletId/ledger` | `items` e `nextCursor`. Cada item contém `id`, `walletId`, `transactionId`, `direction`, `money`, `balanceBefore`, `balanceAfter` e `createdAt`. |
+| `GET /wagering/transactions/:transactionId` | `transactionId`, `walletId`, `providerId`, `externalTransactionId`, `roundId`, `gameId`, `kind`, `status`, `money` e `createdAt`. Inclui `observedBalance`, `finalizedAt`, `failureCode` e IDs de referência quando disponíveis. |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | Mesmo DTO, buscado pelo par de IDs da rota. |
+
+A consulta de uma transação encontrada responde `200` em qualquer estado. O saldo observado representa a decisão gravada. `OPENING` pode ser consultada pelo ID interno para permitir a navegação a partir do ledger. A rota por provedor retorna `404` para o provedor reservado. Parâmetros inválidos geram `400` e recursos ausentes geram `404`. Falhas transitórias conhecidas de conexão ou do pool geram `503`, inclusive desconexões e timeouts de conexão que o driver reporta sem SQLSTATE. Erros inesperados continuam retornando `500`.
+
+O ledger usa `limit` de 1 a 100, com padrão 50. Cada página ordena por `created_at DESC, id DESC` e lê `limit + 1` para determinar se há próxima página. O cursor versionado usa HMAC-SHA256 e vincula a wallet ao ID do último lançamento devolvido. Antes de executar `bun run start`, configure `LEDGER_CURSOR_SECRET` com 32 bytes aleatórios em hexadecimal, por exemplo com `openssl rand -hex 32`, e compartilhe o valor entre as instâncias HTTP. Com a variável ausente ou fora do formato de 64 caracteres hexadecimais, o processo HTTP encerra antes de abrir a porta. A mensagem de configuração omite o valor da chave. Rotacionar a chave invalida cursores anteriores.
+
+A busca da âncora e a comparação da tupla acontecem no PostgreSQL, preservando a precisão do timestamp mesmo quando a data do DTO é serializada em milissegundos. Uma wallet existente sem lançamentos retorna `items: []` e `nextCursor: null`. Cada página lê o estado confirmado naquele instante. Lançamentos novos acima da âncora ficam disponíveis ao reiniciar pela primeira página. Um lançamento confirmado depois com chave anterior à âncora pode aparecer em uma página seguinte.
+
+O escopo SQL por wallet ou provedor separa os registros consultados. A API do desafio assume um ambiente confiável. `FinancialQueryAccessGuard` é o ponto de extensão da autorização dos quatro GETs e atualmente permite a passagem. Para uso com clientes não confiáveis, a integração com um provedor OIDC externo deve validar o token e vincular suas identidades de jogador ou provedor aos recursos autorizados antes de entregar dados. IDs da URL e cursores não comprovam essa autorização.

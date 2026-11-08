@@ -3,9 +3,12 @@ import { Module } from '@nestjs/common';
 import { SubmitWager } from '../../application/submit-wager.js';
 import { PostgresWagerStore } from '../database/postgres-wager-store.js';
 import { WageringController } from './wagering.controller.js';
+import { FinancialQueriesModule } from './financial-queries.module.js';
+import { ProviderTransactionsController } from './provider-transactions.controller.js';
 
 @Module({
-  controllers: [WageringController],
+  imports: [FinancialQueriesModule],
+  controllers: [WageringController, ProviderTransactionsController],
   providers: [{
     provide: SubmitWager,
     inject: [EntityManager],
