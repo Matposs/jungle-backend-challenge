@@ -15,5 +15,23 @@ services:
       timeout: 3s
       retries: 10
 
+  localstack:
+    image: localstack/localstack:4.4.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      SQS_ENDPOINT_STRATEGY: dynamic
+    ports:
+      - "127.0.0.1:${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - ./infra/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD", "awslocal", "sqs", "get-queue-url", "--queue-name", "wagering-events.fifo"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+
 volumes:
   postgres-data:

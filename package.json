@@ -12,11 +12,14 @@
     "build": "bun node_modules/typescript/bin/tsc -p tsconfig.build.json",
     "start": "bun dist/main.js",
     "test": "bun test",
+    "sqs:consume": "bun dist/infrastructure/sqs/consume-wagers.js",
+    "outbox:publish": "bun dist/infrastructure/sqs/publish-outbox.js",
     "migration:up": "bun src/infrastructure/database/migrate.ts up",
     "migration:status": "bun src/infrastructure/database/migrate.ts status",
     "migration:down": "bun src/infrastructure/database/migrate.ts down"
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "^3.1164.0",
     "@mikro-orm/core": "^7.2.8",
     "@mikro-orm/migrations": "7.2.8",
     "@mikro-orm/nestjs": "^7.1.0",

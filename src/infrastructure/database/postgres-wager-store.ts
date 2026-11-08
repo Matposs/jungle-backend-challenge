@@ -1,20 +1,23 @@
 import { ConnectionException, DeadlockException, IsolationLevel, LockMode, UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import {
-  DuplicateReversalError, InvalidWagerInputError, WagerIdentityConflictError, WagerUnavailableError,
-  type ApplyWager, type WagerResult, type WagerStore,
+  DuplicateReversalError, InboxPayloadConflictError, InvalidWagerInputError, WagerIdentityConflictError, WagerUnavailableError,
+  type ApplyWager, type InboxDelivery, type WagerResult, type WagerStore,
 } from '../../application/submit-wager.js';
 import { WagerTransactionKind as Kind, WagerTransactionStatus as Status, type WagerTransaction } from '../../domain/wager-transaction.js';
 import { ledgerEntryToRecord, wagerTransactionFromRecord, wagerTransactionToRecord, walletFromRecord } from './financial-mappers.js';
 import { WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord } from './financial-records.js';
 import { insertOutboxEvents } from './outbox-record.js';
+import { InboxRecord } from './inbox-record.js';
 
 export class PostgresWagerStore implements WagerStore {
   constructor(private readonly em: EntityManager) {}
 
-  async submit(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult> {
+  submit(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult>;
+  submit(transaction: WagerTransaction, apply: ApplyWager, delivery: InboxDelivery): Promise<WagerResult | undefined>;
+  async submit(transaction: WagerTransaction, apply: ApplyWager, delivery?: InboxDelivery): Promise<WagerResult | undefined> {
     try {
-      return await this.#submitOrReplay(transaction, apply);
+      return await this.#submitOrReplay(transaction, apply, delivery);
     } catch (error) {
       if (error instanceof ConnectionException || error instanceof DeadlockException ||
           (error instanceof Error && 'code' in error &&
@@ -25,9 +28,9 @@ export class PostgresWagerStore implements WagerStore {
     }
   }
 
-  async #submitOrReplay(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult> {
+  async #submitOrReplay(transaction: WagerTransaction, apply: ApplyWager, delivery?: InboxDelivery): Promise<WagerResult | undefined> {
     try {
-      return await this.em.fork().transactional(async (tx) => {
+      return await this.#transactionWithInbox(delivery, async (tx) => {
         const existing = await this.#findReplay(tx, transaction);
         if (existing) return existing;
 
@@ -53,20 +56,47 @@ export class PostgresWagerStore implements WagerStore {
         }
         await insertOutboxEvents(tx, events);
         return { transaction, idempotentReplay: false };
-      }, { isolationLevel: IsolationLevel.READ_COMMITTED });
+      });
     } catch (error) {
       if (error instanceof UniqueConstraintViolationException && 'constraint' in error) {
         const { kind } = transaction;
         const duplicateReversal = (kind === Kind.Refund || kind === Kind.Rollback) && error.constraint === 'wager_reversal_reference_unique';
         if (!duplicateReversal && error.constraint !== 'wager_provider_idempotency_unique' &&
             error.constraint !== 'wager_provider_external_unique') throw error;
-        // Read the winning identity only after the failed transaction has rolled back.
-        const replay = await this.#findReplay(this.em.fork(), transaction);
-        if (replay) return replay;
-        if (duplicateReversal) throw new DuplicateReversalError(kind);
+        // Resolve the winning identity only after the failed transaction has rolled back.
+        return this.#transactionWithInbox(delivery, async (tx) => {
+          const replay = await this.#findReplay(tx, transaction);
+          if (replay) return replay;
+          if (duplicateReversal) throw new DuplicateReversalError(kind);
+          throw error;
+        });
       }
       throw error;
     }
+  }
+
+  async #transactionWithInbox(
+    delivery: InboxDelivery | undefined,
+    operation: (tx: EntityManager) => Promise<WagerResult>,
+  ): Promise<WagerResult | undefined> {
+    return this.em.fork().transactional(async (tx) => {
+      if (!delivery) return operation(tx);
+
+      const { consumerName, messageId, payloadHash } = delivery;
+      const identity = { consumerName, messageId };
+      const inserted = await tx.createQueryBuilder(InboxRecord).insert(delivery)
+        .onConflict(['consumerName', 'messageId']).ignore().returning('messageId').execute<{ messageId: string }[]>('all');
+      if (inserted.length === 0) {
+        const existing = await tx.findOneOrFail(InboxRecord, identity);
+        if (existing.payloadHash !== payloadHash) throw new InboxPayloadConflictError('Message identity is bound to a different payload.');
+        if (!existing.processedAt) throw new Error('Inbox record has no committed outcome.');
+        return undefined;
+      }
+
+      const result = await operation(tx);
+      await tx.nativeUpdate(InboxRecord, identity, { processedAt: new Date() });
+      return result;
+    }, { isolationLevel: IsolationLevel.READ_COMMITTED });
   }
 
   async #hasCompetingBetReversal(tx: EntityManager, transaction: WagerTransaction): Promise<boolean> {

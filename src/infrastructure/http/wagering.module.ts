@@ -11,5 +11,6 @@ import { WageringController } from './wagering.controller.js';
     inject: [EntityManager],
     useFactory: (em: EntityManager) => new SubmitWager(new PostgresWagerStore(em)),
   }],
+  exports: [SubmitWager],
 })
 export class WageringModule {}

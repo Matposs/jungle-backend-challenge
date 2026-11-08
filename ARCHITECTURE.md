@@ -33,6 +33,8 @@ FINANCIAL_TEST_DATABASE_URL='postgresql://usuario:senha@127.0.0.1:5432/jungle_te
 
 Sem `FINANCIAL_TEST_DATABASE_URL`, `bun test` pula os testes de integração PostgreSQL.
 
+Para incluir os testes do consumidor, suba o Compose com o banco de testes e forneça também `FINANCIAL_TEST_SQS_ENDPOINT`, com a URL HTTP local do LocalStack. Essa suíte cria filas FIFO próprias, com nomes aleatórios, e remove somente essas filas. Os testes usam PostgreSQL e SQS reais. A falha de ACK é injetada no cliente antes do envio do `DeleteMessage`, e a reentrega vem do broker.
+
 ## Abertura de wallet e Outbox
 
 `POST /wallets` recebe `playerId` como string opaca não vazia, pois o README usa UUID como exemplo e mantém o tipo `string`. A moeda e a escala são validadas por `Money`. O endpoint retorna `201` com a wallet na versão `1`, `400` para entrada inválida e `409` para conflito na constraint `wallets_player_currency_unique`.
@@ -64,3 +66,37 @@ O índice `wager_reversal_reference_unique` reserva cada referência por provedo
 O índice por tipo continua garantindo unicidade separada para `REFUND` e `ROLLBACK`. Para evitar dois créditos sobre a mesma `BET`, ambos os fluxos verificam a reversão do outro tipo **depois** de obter `SELECT FOR UPDATE` na wallet, na mesma transação e em `READ COMMITTED`. Isso garante que a segunda operação veja o resultado confirmado pela primeira. Uma reversão pendente reserva a compensação no mesmo provedor, wallet, rodada e referência externa. Se o alvo ainda é desconhecido, os dois tipos competem por essa reserva, pois o alvo pode ser uma `BET`. Se o alvo é conhecido e é `WIN` ou `REFUND`, seu `ROLLBACK` não compete pela compensação de `BET`. Uma compensação pendente ou efetiva do outro tipo gera `422 BET_COMPENSATION_CONFLICT` com rejeição auditável.
 
 Um `REFUND` processado continua sendo uma compensação efetiva até um `ROLLBACK(REFUND)` processado debitar seu valor. Um `ROLLBACK(REFUND)` pendente ou rejeitado mantém a compensação ativa. Depois que o crédito é desfeito, um `ROLLBACK(BET)` direto pode creditar a aposta uma vez. O índice por tipo continua reservando o `REFUND` original para fins de unicidade, preservando seu histórico e replay. O futuro reprocessamento de referências pendentes terá de repetir a verificação sob o mesmo lock antes de creditar a wallet.
+
+## Consumo SQS e Inbox
+
+O Compose sobe LocalStack 4.4.0 com SQS e executa o hook de inicialização que provisiona `wager-transactions.fifo` e `wager-transactions-dlq.fifo`. O source tem visibilidade de 60 segundos e redrive após cinco recebimentos. A aplicação usa o SDK oficial, `SQS_ENDPOINT`, `AWS_REGION` e a cadeia de credenciais da AWS. Os valores `test` do `.env.example` são exclusivos para o emulador local. Em AWS, a fila e a política de redrive devem ser provisionadas no mesmo ambiente do consumidor.
+
+```sh
+cp .env.example .env
+docker compose up -d --wait
+bun run migration:up
+bun run build
+bun run sqs:consume
+```
+
+O consumidor roda em um processo independente do HTTP. Múltiplas instâncias podem consumir a mesma fila com o nome lógico `wager-transactions`. Produtores podem usar a wallet como `MessageGroupId` para reduzir disputas, mas a correção depende das constraints e locks do PostgreSQL.
+
+HTTP e SQS compartilham a validação de campos de negócio, o caso de uso e o hash da operação. Para SQS, a migration incremental cria a Inbox com chave primária `(consumer_name, message_id)`, usando o ID lógico do envelope. A reserva via `INSERT … ON CONFLICT DO NOTHING`, os efeitos financeiros e a marca de processamento ficam na mesma transação SQL. O hash da Inbox é SHA-256 do envelope JSON com chaves ordenadas recursivamente. Ele diferencia payloads divergentes sob o mesmo ID, inclusive se só um metadado do envelope mudar. A idempotência da transação continua evitando efeitos repetidos entre mensagens com IDs diferentes e entre HTTP e SQS.
+
+- O consumidor remove a mensagem após o commit, inclusive em replay, rejeição de negócio persistida e `PENDING_REFERENCE`. Se houver falha no ACK depois do commit, a reentrega passa pela Inbox sem repetir efeitos financeiros.
+- Falhas transitórias e inesperadas ficam disponíveis para reentrega com backoff de visibilidade exponencial de 1 a 60 segundos. O consumidor renova a visibilidade a cada 20 segundos durante o processamento.
+- Envelope inválido, conflitos de identidade ou de payload da Inbox e duplicata de reversão com identidade distinta são falhas permanentes de submissão. Cada tentativa é registrada em log estruturado, sem payload financeiro ou mensagem de exceção. A visibilidade volta imediatamente a zero para o redrive nativo do SQS mover a mensagem à DLQ após o limite de recebimentos.
+- Em `SIGTERM` ou `SIGINT`, o consumidor encerra o polling e aguarda a operação e o ACK em andamento. Se um poll que já estava em curso retornar durante a parada, o consumidor devolve a visibilidade da mensagem. O poll normal dura até 10 segundos. Interrupções forçadas ainda podem causar reentrega, que é esperada em SQS.
+
+## Publicação da Outbox
+
+Com o Compose saudável, execute `bun run migration:up`, `bun run build` e `bun run outbox:publish`. Esse processo é independente da API e do consumidor. Ele usa `SQS_ENDPOINT`, `AWS_REGION` e a cadeia de credenciais do SDK. `OUTBOX_QUEUE_NAME` seleciona a fila FIFO, com padrão `wagering-events.fifo`. O Compose provisiona essa fila separadamente da entrada de operações financeiras.
+
+O publicador transmite o envelope JSON armazenado. Ele usa `aggregateId` como `MessageGroupId` e `eventId` como `MessageDeduplicationId`. Cada lote seleciona apenas o primeiro evento ainda não publicado de cada agregado com `SELECT FOR UPDATE SKIP LOCKED`. Assim, instâncias diferentes podem publicar agregados diferentes em paralelo, e uma tentativa adiada ou bloqueada impede que o próximo evento do mesmo agregado seja enviado antes dela. A migration incremental adiciona a sequência `publication_order` e o índice por agregado. Ela ordena o histórico de wallet pela versão e desempata os demais eventos antigos por `occurred_at` e `id`. Os produtores existentes serializam as gravações do mesmo agregado financeiro no PostgreSQL. A migration atualiza as linhas existentes da Outbox e deve ser aplicada antes de iniciar os publishers.
+
+O lock é mantido durante o envio ao SQS e a gravação do resultado, com uma transação por lote e envios paralelos entre agregados. O SDK faz uma tentativa por chamada e limita a espera de uma requisição a cinco segundos. O processo só grava `published_at` após receber `MessageId`. Uma falha entre essa confirmação e o commit deixa a linha recuperável. A próxima instância reenvia o mesmo envelope com o mesmo `eventId`. O FIFO deduplica dentro da janela de cinco minutos, e consumidores devem deduplicar por `eventId` para lidar com reentregas fora dela.
+
+- `OUTBOX_BATCH_SIZE` limita o lote, com padrão `10`. `OUTBOX_POLL_INTERVAL_MS`, com padrão `1000`, controla a pausa quando a consulta está vazia ou falha. O processo não dorme dentro da transação.
+- Falhas de envio recuperáveis persistem o código e agendam retry exponencial com `OUTBOX_RETRY_BASE_MS` e `OUTBOX_RETRY_MAX_MS`, com padrões de um e sessenta segundos. As tentativas confirmadas no PostgreSQL incrementam `attempts`, inclusive a de sucesso. Um envio cuja transação de registro falha pode ser repetido sem incrementar o contador daquela transação.
+- Erros permanentes específicos da mensagem preservam o envelope, `failed_at` e `last_error_code` para intervenção operacional. O evento permanece à frente do agregado, bloqueando seus sucessores até ser corrigido e liberado. Falhas de destino ou infraestrutura continuam elegíveis para retry. Logs registram o resultado confirmado no banco, sem o payload financeiro.
+- `SIGTERM` e `SIGINT` interrompem a espera de polling e deixam o lote atual terminar. Uma interrupção forçada libera os locks quando a conexão PostgreSQL fecha.

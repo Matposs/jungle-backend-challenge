@@ -43,12 +43,13 @@ describe.skipIf(!databaseUrl)('POST /wallets on PostgreSQL', () => {
     await orm.em.fork().insert(WalletRecord, {
       id: sentinelId, playerId: sentinelId, balance: '0.00', currency: 'BRL', createdAt: at, updatedAt: at,
     });
-    await orm.migrator.up();
+    await orm.migrator.up({ to: outboxMigration });
     expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([outboxMigration]);
     expect(await orm.em.execute('SELECT to_regclass(?) AS name', [`${schema}.outbox_messages`])).toEqual([{ name: null }]);
     expect(await orm.em.fork().count(WalletRecord, { id: sentinelId })).toBe(1);
     expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual([financialMigration]);
-    expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([outboxMigration]);
+    expect((await orm.migrator.up({ to: outboxMigration })).map(({ name }) => name)).toEqual([outboxMigration]);
+    await orm.migrator.up();
     await app.listen(0, '127.0.0.1');
     url = await app.getUrl();
   });
@@ -80,7 +81,7 @@ describe.skipIf(!databaseUrl)('POST /wallets on PostgreSQL', () => {
 
   test('reapplies the Outbox migration without removing the financial schema or its data', async () => {
     expect(await orm.migrator.getPending()).toHaveLength(0);
-    expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual([financialMigration, outboxMigration]);
+    expect((await orm.migrator.getExecuted()).map(({ name }) => name).slice(0, 2)).toEqual([financialMigration, outboxMigration]);
     expect(await orm.em.fork().count(WalletRecord, { id: sentinelId })).toBe(1);
     expect(await orm.em.execute(
       'SELECT indexname FROM pg_indexes WHERE schemaname = ? AND indexname = ?', [schema, 'outbox_pending_due_idx'],

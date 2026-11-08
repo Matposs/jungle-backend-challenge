@@ -3,6 +3,9 @@ import { defineConfig } from '@mikro-orm/postgresql';
 import { WalletRecord, WagerTransactionRecord, WalletLedgerEntryRecord } from './financial-records.js';
 import { Migration20261107000100_FinancialSchema } from './migrations/Migration20261107000100_FinancialSchema.js';
 import { Migration20261107000200_TransactionalOutbox } from './migrations/Migration20261107000200_TransactionalOutbox.js';
+import { Migration20261107000300_TransactionalInbox } from './migrations/Migration20261107000300_TransactionalInbox.js';
+import { Migration20261107000400_OutboxPublication } from './migrations/Migration20261107000400_OutboxPublication.js';
+import { InboxRecord } from './inbox-record.js';
 import { OutboxRecord } from './outbox-record.js';
 
 export const postgresConfig = defineConfig({
@@ -11,10 +14,13 @@ export const postgresConfig = defineConfig({
   dbName: process.env.POSTGRES_DB ?? 'jungle',
   user: process.env.POSTGRES_USER ?? 'jungle',
   password: process.env.POSTGRES_PASSWORD,
-  entities: [WalletRecord, WagerTransactionRecord, WalletLedgerEntryRecord, OutboxRecord],
+  entities: [WalletRecord, WagerTransactionRecord, WalletLedgerEntryRecord, OutboxRecord, InboxRecord],
   extensions: [Migrator],
   migrations: {
-    migrationsList: [Migration20261107000100_FinancialSchema, Migration20261107000200_TransactionalOutbox],
+    migrationsList: [
+      Migration20261107000100_FinancialSchema, Migration20261107000200_TransactionalOutbox,
+      Migration20261107000300_TransactionalInbox, Migration20261107000400_OutboxPublication,
+    ],
     transactional: true,
     disableForeignKeys: false,
     snapshot: false,

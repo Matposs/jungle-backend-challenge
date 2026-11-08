@@ -14,6 +14,8 @@ export const OutboxRecord = defineEntity({
     attempts: p.integer().default(0),
     nextAttemptAt: p.datetime().columnType('timestamptz').nullable(),
     publishedAt: p.datetime().columnType('timestamptz').nullable(),
+    failedAt: p.datetime().columnType('timestamptz').nullable(),
+    lastErrorCode: p.text().nullable(),
   }),
 });
 

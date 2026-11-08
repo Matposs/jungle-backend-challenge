@@ -39,8 +39,17 @@ export type ApplyWager = (
 
 export interface WagerStore {
   submit(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult>;
+  submit(transaction: WagerTransaction, apply: ApplyWager, delivery: InboxDelivery): Promise<WagerResult | undefined>;
 }
 
+export interface InboxDelivery {
+  readonly consumerName: string;
+  readonly messageId: string;
+  readonly payloadHash: string;
+  readonly receivedAt: Date;
+}
+
+export class InboxPayloadConflictError extends Error {}
 export class WagerIdentityConflictError extends Error {}
 export class DuplicateReversalError extends Error {
   readonly failureCode: 'DUPLICATE_REFUND' | 'DUPLICATE_ROLLBACK';
@@ -56,7 +65,9 @@ export class WagerUnavailableError extends Error {}
 export class SubmitWager {
   constructor(private readonly store: WagerStore) {}
 
-  execute(input: SubmitWagerInput): Promise<WagerResult> {
+  execute(input: SubmitWagerInput): Promise<WagerResult>;
+  execute(input: SubmitWagerInput, delivery: InboxDelivery): Promise<WagerResult | undefined>;
+  execute(input: SubmitWagerInput, delivery?: InboxDelivery): Promise<WagerResult | undefined> {
     if (input.kind !== Kind.Loss && !input.money.isPositive()) {
       throw new InvalidWagerInputError(`${input.kind} requires a positive amount.`);
     }
@@ -85,8 +96,9 @@ export class SubmitWager {
       ...input, id: crypto.randomUUID(), payloadHash,
     });
 
-    return this.store.submit(transaction, (wallet, reference, hasCompetingBetReversal) =>
-      this.#apply(wallet, transaction, reference, hasCompetingBetReversal));
+    const apply: ApplyWager = (wallet, reference, hasCompetingBetReversal) =>
+      this.#apply(wallet, transaction, reference, hasCompetingBetReversal);
+    return delivery ? this.store.submit(transaction, apply, delivery) : this.store.submit(transaction, apply);
   }
 
   async #apply(
