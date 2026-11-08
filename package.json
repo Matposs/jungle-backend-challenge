@@ -1,0 +1,35 @@
+{
+  "name": "jungle-backend-challenge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "scripts": {
+    "dev": "bun run build && bun run --parallel dev:compile dev:serve",
+    "dev:compile": "bun node_modules/typescript/bin/tsc -p tsconfig.build.json --watch --preserveWatchOutput",
+    "dev:serve": "bun --watch dist/main.js",
+    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit",
+    "build": "bun node_modules/typescript/bin/tsc -p tsconfig.build.json",
+    "start": "bun dist/main.js",
+    "test": "bun test",
+    "migration:up": "bun src/infrastructure/database/migrate.ts up",
+    "migration:status": "bun src/infrastructure/database/migrate.ts status",
+    "migration:down": "bun src/infrastructure/database/migrate.ts down"
+  },
+  "dependencies": {
+    "@mikro-orm/core": "^7.2.8",
+    "@mikro-orm/migrations": "7.2.8",
+    "@mikro-orm/nestjs": "^7.1.0",
+    "@mikro-orm/postgresql": "^7.2.8",
+    "@nestjs/common": "^11.1.0",
+    "@nestjs/core": "^11.1.0",
+    "@nestjs/platform-express": "^11.1.0",
+    "decimal.js": "^10.6.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "~5.9.3"
+  }
+}
