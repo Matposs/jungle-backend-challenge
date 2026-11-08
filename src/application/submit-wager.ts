@@ -31,11 +31,7 @@ export interface WagerEffects {
   readonly events: readonly IntegrationEvent<object>[];
 }
 
-export type ApplyWager = (
-  wallet: Wallet,
-  reference: WagerTransaction | undefined,
-  hasCompetingBetReversal: () => Promise<boolean>,
-) => Promise<WagerEffects>;
+export type ApplyWager = typeof applyWager;
 
 export interface WagerStore {
   submit(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult>;
@@ -96,86 +92,90 @@ export class SubmitWager {
       ...input, id: crypto.randomUUID(), payloadHash,
     });
 
-    const apply: ApplyWager = (wallet, reference, hasCompetingBetReversal) =>
-      this.#apply(wallet, transaction, reference, hasCompetingBetReversal);
-    return delivery ? this.store.submit(transaction, apply, delivery) : this.store.submit(transaction, apply);
+    return delivery ? this.store.submit(transaction, applyWager, delivery) : this.store.submit(transaction, applyWager);
+  }
+}
+
+export async function applyWager(
+  wallet: Wallet,
+  transaction: WagerTransaction,
+  reference: WagerTransaction | undefined,
+  hasCompetingBetReversal: () => Promise<boolean>,
+  at = new Date(),
+  referenceDeadline?: number,
+): Promise<WagerEffects> {
+  if (wallet.playerId !== transaction.playerId || wallet.currency !== transaction.currency) {
+    throw new InvalidWagerInputError('Wallet does not match the player and currency.');
   }
 
-  async #apply(
-    wallet: Wallet,
-    transaction: WagerTransaction,
-    reference: WagerTransaction | undefined,
-    hasCompetingBetReversal: () => Promise<boolean>,
-  ): Promise<WagerEffects> {
-    if (wallet.playerId !== transaction.playerId || wallet.currency !== transaction.currency) {
-      throw new InvalidWagerInputError('Wallet does not match the player and currency.');
-    }
+  const context = { eventId: crypto.randomUUID(), correlationId: transaction.id };
+  const reject = (code: string, referenceTransactionId?: string): WagerEffects => {
+    transaction.reject(code, { referenceTransactionId, observedBalance: wallet.balance, at });
+    return { events: [WagerTransactionRejected.from(transaction, context)] };
+  };
 
-    const at = new Date();
-    const context = { eventId: crypto.randomUUID(), correlationId: transaction.id };
-    const reject = (code: string, referenceTransactionId?: string): WagerEffects => {
-      transaction.reject(code, { referenceTransactionId, observedBalance: wallet.balance, at });
-      return { events: [WagerTransactionRejected.from(transaction, context)] };
-    };
-
-    if (transaction.referenceExternalTransactionId !== undefined) {
-      if (reference) {
-        try {
-          transaction.assertReferenceScope(reference);
-        } catch (error) {
-          if (!(error instanceof WagerTransactionError)) throw error;
-          return reject('INVALID_REFERENCE');
-        }
-        if (reference.isTerminal() && reference.status !== Status.Processed) {
-          return reject('REFERENCE_NOT_PROCESSED', reference.id);
-        }
-        if (transaction.requiresReference() && !transaction.money.equals(reference.money)) {
-          return reject('REFERENCE_AMOUNT_MISMATCH', reference.id);
-        }
+  if (transaction.referenceExternalTransactionId !== undefined) {
+    if (reference) {
+      try {
+        transaction.assertReferenceScope(reference);
+      } catch (error) {
+        if (!(error instanceof WagerTransactionError)) throw error;
+        return reject('INVALID_REFERENCE');
       }
-      if (transaction.requiresReference() && (!reference || reference.kind === Kind.Bet) && await hasCompetingBetReversal()) {
-        return reject('BET_COMPENSATION_CONFLICT', reference?.id);
+      if (reference.isTerminal() && reference.status !== Status.Processed) {
+        return reject('REFERENCE_NOT_PROCESSED', reference.id);
       }
-      if (reference?.status !== Status.Processed) {
-        transaction.markPendingReference();
-        return { events: [WagerTransactionPendingReference.from(transaction, at, context)] };
+      if (transaction.requiresReference() && !transaction.money.equals(reference.money)) {
+        return reject('REFERENCE_AMOUNT_MISMATCH', reference.id);
       }
     }
-
-    if (transaction.kind === Kind.Loss) {
-      transaction.markProcessed({ observedBalance: wallet.balance, at });
-      return { events: [WagerTransactionProcessed.from(transaction, context)] };
+    if (referenceDeadline !== undefined && at.getTime() >= referenceDeadline) {
+      if (!reference) return reject('REFERENCE_NOT_FOUND');
+      return reject(reference.status === Status.Processed ? 'REFERENCE_WINDOW_EXPIRED' : 'REFERENCE_NOT_READY', reference.id);
     }
-
-    let change;
-    const direction = transaction.ledgerDirectionFor(reference);
-    if (!direction) throw new Error('A financial wager must have a ledger direction.');
-    const debit = direction === LedgerDirection.Debit;
-    try {
-      change = debit ? wallet.debit(transaction.money, at) : wallet.credit(transaction.money, at);
-    } catch (error) {
-      if (debit && error instanceof InsufficientFundsError) {
-        return reject(transaction.kind === Kind.Rollback ? 'REVERSAL_INSUFFICIENT_FUNDS' : 'INSUFFICIENT_FUNDS', reference?.id);
-      }
-      if (!debit && error instanceof MoneyError) return reject('BALANCE_LIMIT_EXCEEDED', reference?.id);
-      throw error;
+    if (transaction.requiresReference() && (!reference || reference.kind === Kind.Bet) && await hasCompetingBetReversal()) {
+      return reject('BET_COMPENSATION_CONFLICT', reference?.id);
     }
-
-    if (!change) throw new Error('A positive wager movement must change the balance.');
-    transaction.markProcessed({ reference, observedBalance: wallet.balance, at });
-    const entry = WalletLedgerEntry.create({
-      ...change, id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
-      direction, money: transaction.money, createdAt: at,
-    });
-
-    return {
-      entry,
-      events: [
-        WagerTransactionProcessed.from(transaction, context),
-        WalletBalanceChanged.from(wallet, entry, {
-          eventId: crypto.randomUUID(), correlationId: transaction.id, causationId: transaction.id,
-        }),
-      ],
-    };
+    if (reference?.status !== Status.Processed) {
+      if (transaction.status === Status.PendingReference) return { events: [] };
+      transaction.markPendingReference();
+      return { events: [WagerTransactionPendingReference.from(transaction, at, context)] };
+    }
   }
+
+  if (transaction.kind === Kind.Loss) {
+    transaction.markProcessed({ observedBalance: wallet.balance, at });
+    return { events: [WagerTransactionProcessed.from(transaction, context)] };
+  }
+
+  let change;
+  const direction = transaction.ledgerDirectionFor(reference);
+  if (!direction) throw new Error('A financial wager must have a ledger direction.');
+  const debit = direction === LedgerDirection.Debit;
+  try {
+    change = debit ? wallet.debit(transaction.money, at) : wallet.credit(transaction.money, at);
+  } catch (error) {
+    if (debit && error instanceof InsufficientFundsError) {
+      return reject(transaction.kind === Kind.Rollback ? 'REVERSAL_INSUFFICIENT_FUNDS' : 'INSUFFICIENT_FUNDS', reference?.id);
+    }
+    if (!debit && error instanceof MoneyError) return reject('BALANCE_LIMIT_EXCEEDED', reference?.id);
+    throw error;
+  }
+
+  if (!change) throw new Error('A positive wager movement must change the balance.');
+  transaction.markProcessed({ reference, observedBalance: wallet.balance, at });
+  const entry = WalletLedgerEntry.create({
+    ...change, id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
+    direction, money: transaction.money, createdAt: at,
+  });
+
+  return {
+    entry,
+    events: [
+      WagerTransactionProcessed.from(transaction, context),
+      WalletBalanceChanged.from(wallet, entry, {
+        eventId: crypto.randomUUID(), correlationId: transaction.id, causationId: transaction.id,
+      }),
+    ],
+  };
 }

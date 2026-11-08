@@ -14,7 +14,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 | --- | --- |
 | [`src/domain`](../src/domain) | `Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction` e envelopes de integração versionados |
 | [`src/application`](../src/application) | `OpenWallet`, `SubmitWager` e validação de entrada compartilhada |
-| [`src/infrastructure/database`](../src/infrastructure/database) | Transações, mapeadores, registros e quatro migrations explícitas |
+| [`src/infrastructure/database`](../src/infrastructure/database) | Transações, mapeadores, registros, quatro migrations explícitas e worker de referências |
 | [`src/infrastructure/http`](../src/infrastructure/http) | Controllers e composição NestJS da API |
 | [`src/infrastructure/sqs`](../src/infrastructure/sqs) | Consumidor e publicador, com pontos de entrada independentes |
 | [`infra/localstack`](../infra/localstack) e [`test`](../test) | Provisionamento local das filas e testes de domínio, HTTP e integração |
@@ -36,6 +36,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 | 11 | `ROLLBACK` integral de `BET`, `WIN` ou `REFUND`, com proteção contra dupla compensação |
 | 12 | Consumidor SQS, Inbox transacional, redelivery, DLQ e shutdown |
 | 13 | Publicador Outbox concorrente, retry persistente e recuperação após falha |
+| 14 | Worker de referências pendentes com retry persistente, TTL e desfecho transacional |
 
 ## Fluxos e garantias atuais
 
@@ -44,10 +45,11 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 - **Replay.** O provedor delimita a unicidade da chave e do ID externo. O hash SHA-256 canônico dos campos de negócio detecta divergência entre HTTP e SQS. A operação gravada fornece o resultado e o saldo originalmente observado quando aplicável. O algoritmo e a política de compensação estão no `ARCHITECTURE.md`.
 - **SQS e Inbox.** `wager-transactions.fifo` usa redrive para `wager-transactions-dlq.fifo` após cinco recebimentos. O consumidor reutiliza `SubmitWager`. A chave `(consumer_name, message_id)`, o hash do envelope e a conclusão ficam na mesma transação dos efeitos. O ACK ocorre depois do commit, inclusive para rejeições persistidas e referências pendentes. Falhas transitórias usam backoff de visibilidade e falhas permanentes seguem para a DLQ.
 - **Outbox.** O publicador lê eventos confirmados com `FOR UPDATE SKIP LOCKED`, seleciona o primeiro evento por agregado e publica o envelope em `wagering-events.fifo`. São emitidos `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference` e `WalletBalanceChanged` conforme o resultado. O publicador grava sucesso após o ACK do broker e persiste os retries. `aggregateId` ordena o grupo e `eventId` é estável para deduplicação.
+- **Referências pendentes.** O worker reavalia `WIN`, `REFUND` e `ROLLBACK` sob lock da wallet, com retry persistente de 5 segundos a 5 minutos e prazo de 24 horas. O desfecho fica na operação original e é publicado pela Outbox.
 
 ## Execução e validação
 
-Para executar a aplicação localmente, copie `.env.example` para `.env`, defina a senha local, execute `bun install --frozen-lockfile` e `docker compose up -d --wait`. Rode `bun run migration:status`, `bun run migration:up` e `bun run build`. Inicie os processos necessários em terminais separados com `bun run start`, `bun run sqs:consume` e `bun run outbox:publish`. `bun run migration:down` reverte a última migration aplicada e deve ser exercitado em ambiente descartável.
+Para executar a aplicação localmente, copie `.env.example` para `.env`, defina a senha local, execute `bun install --frozen-lockfile` e `docker compose up -d --wait`. Rode `bun run migration:status`, `bun run migration:up` e `bun run build`. Inicie os processos necessários em terminais separados com `bun run start`, `bun run sqs:consume`, `bun run outbox:publish` e `bun run references:process`. `bun run migration:down` reverte a última migration aplicada e deve ser exercitado em ambiente descartável.
 
 Para reproduzir a validação completa a partir da raiz, use um projeto Compose separado e portas locais livres. O exemplo usa as credenciais de demonstração do `.env.example` para o ambiente descartável.
 
@@ -66,14 +68,15 @@ unset POSTGRES_PORT LOCALSTACK_PORT POSTGRES_DB
 
 Use um banco que termine em `_test` e um endpoint LocalStack HTTP em loopback. As suítes criam schemas e filas exclusivos. Sem a URL do banco, os testes financeiros de integração são pulados. Sem o endpoint SQS, as suítes de Inbox e publisher também são puladas.
 
-A validação do checkpoint obteve 137 aprovações em 10 arquivos, com 65 testes de integração que acessam PostgreSQL, dos quais 17 também acessam LocalStack. A suíte verifica aplicação, reversão e reaplicação das migrations, 50 submissões simultâneas em três instâncias, disputa de saldo, independência entre wallets, redelivery, DLQ, falhas no commit e concorrência de publicadores. As falhas são injetadas em pontos controlados e os efeitos são verificados nos serviços reais.
+A validação do checkpoint do Bloco 13 obteve 137 aprovações em 10 arquivos, com 65 testes de integração que acessam PostgreSQL, dos quais 17 também acessam LocalStack. A suíte verifica aplicação, reversão e reaplicação das migrations, 50 submissões simultâneas em três instâncias, disputa de saldo, independência entre wallets, redelivery, DLQ, falhas no commit e concorrência de publicadores. As falhas são injetadas em pontos controlados e os efeitos são verificados nos serviços reais.
+
+O Bloco 14 acrescentou 13 testes de integração com PostgreSQL. A suíte completa passou com 150 testes em 11 arquivos, incluindo os cenários com LocalStack. Os testes do worker cobrem resolução tardia, cadeias, retry, fronteira do TTL, ordem de seleção sob backlog, concorrência, progresso entre ciclos com falha persistente, retomada após falha no commit, replay terminal, consistência do ledger e ordem do desfecho na Outbox.
 
 ## Pendências e ordem de retomada
 
-1. **Worker de referências pendentes.** Já existem estado, contador, próximo horário e índice. Falta processar a chegada fora de ordem com seleção concorrente, backoff, limite ou TTL documentado e rejeição com evento no esgotamento. Reaplique o lock da wallet e a proteção de reversões. Cubra replay após a conclusão da pendência e a chegada tardia de `BET` para `REFUND` e `ROLLBACK`. Hoje o replay pendente continua em `202` depois que a referência chega.
-2. **Consultas HTTP e reconciliação.** Implemente `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger` com cursor estável e opaco, `GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId`. Implemente `POST /wallets/:walletId/reconciliation` com leitura consistente do saldo e do ledger, resposta da divergência, log e métrica. O contrato exige preservar os dados e sinalizar diferenças para análise.
-3. **Readiness e observabilidade.** Falta `GET /health/ready` com PostgreSQL e SQS, além das métricas oficiais de status, duplicatas, retries, DLQ, conflitos de lock, atraso da Outbox e latência. Consumidor e publisher já emitem logs JSON. Falta completar a correlação entre os transportes e os fluxos financeiros, mantendo payloads completos e segredos fora dos logs.
-4. **Validação e entrega.** Complete a matriz do README, incluindo um cenário automatizado que mate o consumidor entre commit e ACK e reinicie em processo independente. A suíte atual valida a mesma fronteira com falha de ACK injetada e redelivery real. Verifique o saldo reconstruído pelo ledger nas novas suítes. Finalize setup, comandos e evidências de entrega. Se mantida a decisão de omitir autenticação, documente o desenho e explicite o ponto de extensão conforme o README §2.
+1. **Consultas HTTP e reconciliação.** Implemente `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger` com cursor estável e opaco, `GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId`. Implemente `POST /wallets/:walletId/reconciliation` com leitura consistente do saldo e do ledger, resposta da divergência, log e métrica. O contrato exige preservar os dados e sinalizar diferenças para análise.
+2. **Readiness e observabilidade.** Falta `GET /health/ready` com PostgreSQL e SQS, além das métricas oficiais de status, duplicatas, retries, DLQ, conflitos de lock, atraso da Outbox e latência. Consumidor e publisher já emitem logs JSON. Falta completar a correlação entre os transportes e os fluxos financeiros, mantendo payloads completos e segredos fora dos logs.
+3. **Validação e entrega.** Complete a matriz do README, incluindo um cenário automatizado que mate o consumidor entre commit e ACK e reinicie em processo independente. A suíte atual valida a mesma fronteira com falha de ACK injetada e redelivery real. Verifique o saldo reconstruído pelo ledger nas novas suítes. Finalize setup, comandos e evidências de entrega. Se mantida a decisão de omitir autenticação, documente o desenho e explicite o ponto de extensão conforme o README §2.
 
 ## Limitações operacionais
 

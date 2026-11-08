@@ -37,14 +37,20 @@ export function wagerTransactionToRecord(transaction: WagerTransaction): Omit<Tr
     roundId: transaction.roundId,
     gameId: transaction.gameId,
     kind: transaction.kind,
-    status: transaction.status,
     amount: transaction.amount,
     currency: transaction.currency,
     referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
+    createdAt: transaction.createdAt,
+    ...wagerOutcomeToRecord(transaction),
+  };
+}
+
+export function wagerOutcomeToRecord(transaction: WagerTransaction) {
+  return {
+    status: transaction.status,
     referenceTransactionId: transaction.referenceTransactionId ?? null,
     failureCode: transaction.failureCode ?? null,
     observedBalance: transaction.observedBalance?.toJSON().amount ?? null,
-    createdAt: transaction.createdAt,
     finalizedAt: transaction.finalizedAt ?? null,
   };
 }
