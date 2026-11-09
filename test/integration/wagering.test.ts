@@ -10,6 +10,7 @@ import type { MoneyProps } from '../../src/domain/money.js';
 import { WagerTransactionKind as Kind, WagerTransactionStatus as Status } from '../../src/domain/wager-transaction.js';
 import { WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord } from '../../src/infrastructure/database/financial-records.js';
 import { OutboxRecord } from '../../src/infrastructure/database/outbox-record.js';
+import { PostgresWagerStore } from '../../src/infrastructure/database/postgres-wager-store.js';
 import { WageringModule } from '../../src/infrastructure/http/wagering.module.js';
 import { WalletsModule } from '../../src/infrastructure/http/wallets.module.js';
 import { financialTestConfig } from './financial-test-config.js';
@@ -427,6 +428,44 @@ describe.skipIf(!databaseUrl)('Wagering on PostgreSQL', () => {
     expect((await state(wallet.id, Kind.Refund)).wallet.balance).toBe('95.00');
   });
 
+  test.each([Kind.Refund, Kind.Rollback] as const)('isolates a pending %s reservation between wallets during a compensation race', async (kind) => {
+    const wrongWallet = await open(`wrong-wallet-${kind}`);
+    const owner = await open(`owner-wallet-${kind}`);
+    const reference = `late-cross-wallet-bet-${kind}`;
+    const compensation = kind === Kind.Refund ? refund : rollback;
+    const wrong = compensation(wrongWallet, `wrong-${kind}`, '20.00', reference);
+    expect((await submit(wrong)).status).toBe(202);
+    const source = await submit(bet(owner, reference, '20.00'), reference, 1);
+    expect(source.status).toBe(200);
+    const { transactionId: referenceId } = await source.json() as BetResponse;
+
+    const commands = [0, 1].map((index) => compensation(owner, `owner-${kind}-${index}`, '20.00', reference));
+    const responses = await Promise.all(commands.map((body, index) => submit(body, body.externalTransactionId, index + 1)));
+    const results = await Promise.all(responses.map(async (response) => ({ status: response.status, body: await response.json() as BetResponse })));
+    expect(results).toContainEqual({ status: 200, body: expect.objectContaining({ status: Status.Processed }) });
+    expect(results).toContainEqual({ status: 409, body: expect.objectContaining({ failureCode: `DUPLICATE_${kind}` }) });
+
+    const stored = await state(owner.id, kind);
+    expect(stored.wallet).toMatchObject({ balance: '100.00', version: 3 });
+    expect(stored.transactions).toEqual([expect.objectContaining({ status: Status.Processed, referenceTransactionId: referenceId })]);
+    expect(stored.entries).toHaveLength(3);
+    expect(stored.wagerEvents.map(({ eventType }) => eventType).sort()).toEqual(['WagerTransactionProcessed', 'WalletBalanceChanged']);
+
+    const before = await state(wrongWallet.id, kind);
+    expect(before.transactions).toEqual([expect.objectContaining({ status: Status.PendingReference })]);
+    const otherPending = await orm.em.fork().find(WagerTransactionRecord, {
+      walletId: { $ne: wrongWallet.id }, status: Status.PendingReference,
+    });
+    expect(await new PostgresWagerStore(orm.em).processNextPendingReference(otherPending.map(({ id }) => id))).toBe(true);
+    const after = await state(wrongWallet.id, kind);
+    expect(after.transactions).toEqual([expect.objectContaining({ status: Status.Rejected, failureCode: 'INVALID_REFERENCE' })]);
+    expect(after.wallet).toEqual(before.wallet);
+    expect(after.entries).toEqual(before.entries);
+    expect(after.wagerEvents.map(({ eventType }) => eventType).sort()).toEqual([
+      'WagerTransactionPendingReference', 'WagerTransactionRejected',
+    ]);
+  });
+
   test('reserves a missing or pending BET reference and keeps its REFUND pending after the BET arrives', async () => {
     const wallet = await open('refund-pending');
     const missing = refund(wallet, 'refund-missing-bet', '20.00', 'late-refund-bet');
@@ -495,6 +534,46 @@ describe.skipIf(!databaseUrl)('Wagering on PostgreSQL', () => {
     expect((await submit(refund(wallet, 'refund-valid-after-rejections', '20.00', source))).status).toBe(200);
     expect((await state(wallet.id, Kind.Refund)).wallet).toMatchObject({ balance: '100.00', version: 3 });
     expect((await state(other.id, Kind.Refund)).wallet).toMatchObject({ balance: '100.00', version: 1 });
+  });
+
+  test('blocks SQL reassignment of a processed REFUND and preserves the original reversal reservation', async () => {
+    const wallet = await open('immutable-refund-target');
+    const firstBet = bet(wallet, 'immutable-bet-a', '20.00');
+    const secondBet = bet(wallet, 'immutable-bet-b', '20.00');
+    const reversal = refund(wallet, 'immutable-refund', '20.00', firstBet.externalTransactionId);
+    const first = await submit(firstBet);
+    const second = await submit(secondBet);
+    const processed = await submit(reversal);
+    expect([first.status, second.status, processed.status]).toEqual([200, 200, 200]);
+    const { transactionId: firstId } = await first.json() as BetResponse;
+    const { transactionId: secondId } = await second.json() as BetResponse;
+    const { transactionId: refundId } = await processed.json() as BetResponse;
+
+    const mutationCode = await orm.em.execute(
+      `UPDATE "${schema}".wager_transactions
+       SET reference_external_transaction_id = ?, reference_transaction_id = ? WHERE id = ?`,
+      [secondBet.externalTransactionId, secondId, refundId],
+    ).then(() => null, (error: unknown) => {
+      if (!(error instanceof Error) || !('code' in error)) throw error;
+      return error.code;
+    });
+
+    const duplicate = await submit({ ...reversal, externalTransactionId: 'duplicate-immutable-refund' });
+    const stored = await state(wallet.id, Kind.Refund);
+    expect({
+      mutationCode,
+      duplicateStatus: duplicate.status,
+      referenceId: stored.transactions.find(({ id }) => id === refundId)?.referenceTransactionId,
+      balance: stored.wallet.balance,
+      version: stored.wallet.version,
+      refunds: stored.transactions.length,
+      ledger: stored.entries.length,
+      outbox: stored.events.length,
+    }).toEqual({
+      mutationCode: '55000', duplicateStatus: 409, referenceId: firstId,
+      balance: '80.00', version: 4, refunds: 1, ledger: 4, outbox: 8,
+    });
+    expect(await duplicate.json()).toMatchObject({ failureCode: 'DUPLICATE_REFUND' });
   });
 
   test('allows exactly one REFUND when independent identities race to reverse the same BET', async () => {

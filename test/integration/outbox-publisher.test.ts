@@ -3,7 +3,7 @@ import {
   ReceiveMessageCommand, SendMessageCommand, SQSClient, type Message, type SendMessageCommandInput,
 } from '@aws-sdk/client-sqs';
 import { MikroORM, type EntityManager } from '@mikro-orm/postgresql';
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, setSystemTime, test } from 'bun:test';
 import { OpenWallet } from '../../src/application/open-wallet.js';
 import { SubmitWager } from '../../src/application/submit-wager.js';
 import type { IntegrationEventEnvelope } from '../../src/domain/integration-events.js';
@@ -12,6 +12,7 @@ import { WagerTransactionKind as Kind } from '../../src/domain/wager-transaction
 import { OutboxRecord } from '../../src/infrastructure/database/outbox-record.js';
 import { PostgresWagerStore } from '../../src/infrastructure/database/postgres-wager-store.js';
 import { PostgresWalletOpeningStore } from '../../src/infrastructure/database/postgres-wallet-opening-store.js';
+import { processingMetrics } from '../../src/infrastructure/observability/processing-metrics.js';
 import { OutboxPublisher } from '../../src/infrastructure/sqs/outbox-publisher.js';
 import { financialTestConfig } from './financial-test-config.js';
 
@@ -48,9 +49,10 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
     return QueueUrl;
   }
 
-  async function seed(em: EntityManager, eventId: string, aggregateId = eventId, version = 1) {
+  async function seed(em: EntityManager, eventId: string, aggregateId = eventId, version = 1,
+    occurredAt = '2026-01-01T00:00:00.000Z') {
     const payload = {
-      eventId, aggregateId, eventType: 'WalletBalanceChanged', correlationId: eventId, occurredAt: '2026-01-01T00:00:00.000Z',
+      eventId, aggregateId, eventType: 'WalletBalanceChanged', correlationId: eventId, occurredAt,
       version: 1, data: { walletVersion: version },
     };
     await em.execute(`INSERT INTO ${table} (id, aggregate_id, event_type, occurred_at, payload) VALUES (?, ?, ?, ?, ?::jsonb)`,
@@ -96,10 +98,11 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
     // Historical rows have the same timestamp and IDs that sort in the opposite order.
     await seed(orm.em, 'historical-a-v2', 'historical', 2);
     await seed(orm.em, 'historical-z-v1', 'historical', 1);
-    expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([publicationMigration]);
+    expect((await orm.migrator.up({ to: publicationMigration })).map(({ name }) => name)).toEqual([publicationMigration]);
     expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([publicationMigration]);
     expect(await orm.em.execute(`SELECT id FROM ${table} ORDER BY id`)).toEqual([{ id: 'historical-a-v2' }, { id: 'historical-z-v1' }]);
-    expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([publicationMigration]);
+    expect((await orm.migrator.up({ to: publicationMigration })).map(({ name }) => name)).toEqual([publicationMigration]);
+    await orm.migrator.up();
     peer = await MikroORM.init(config);
     sqs = client();
     queue = await createQueue(`outbox-${id}.fifo`);
@@ -144,7 +147,8 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
       'WagerTransactionPendingReference', 'WagerTransactionProcessed', 'WagerTransactionProcessed',
       'WagerTransactionRejected', 'WalletBalanceChanged', 'WalletBalanceChanged',
     ]);
-    const worker = publisher();
+    const logs: Readonly<Record<string, unknown>>[] = [];
+    const worker = new OutboxPublisher(orm.em, sqs, queue, options, (entry) => logs.push(entry));
     let published = 0;
     while (published < events.length) {
       const count = await worker.publishBatch();
@@ -152,6 +156,14 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
       published += count;
     }
     expect(published).toBe(events.length);
+    expect(logs).toHaveLength(events.length);
+    const rejection = events.find(({ eventType }) => eventType === 'WagerTransactionRejected')!;
+    expect(JSON.stringify(logs)).not.toContain('80.00');
+    expect(JSON.stringify(logs)).not.toContain(wallet.playerId);
+    expect(logs.find(({ eventId }) => eventId === rejection.id)).toMatchObject({
+      event: 'outbox_published', transactionId: rejection.aggregateId, correlationId: rejection.payload.correlationId,
+      walletId: wallet.id, providerId: 'publisher-provider', messageId: expect.any(String),
+    });
     const messages = await receive(events.length);
     for (const message of messages) {
       const payload = body(message);
@@ -202,32 +214,46 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
       .toEqual(['first-locked', 'second-locked']);
   }, 10_000);
 
-  test('schedules capped exponential retry after a real SQS failure and recovers when the queue is available', async () => {
+  test('schedules capped exponential retry after a real SQS failure across publishers with divergent clocks', async () => {
+    const retries = /processing_retries_total\{component="outbox"\} (\d+)/;
+    const durationCount = /processing_duration_seconds_count\{component="outbox"\} (\d+)/;
+    const before = processingMetrics.render();
     const eventId = 'retry-event';
     await seed(orm.em, eventId);
     const name = `outbox-recovery-${id}.fifo`;
     const missing = new URL(queue);
     missing.pathname = missing.pathname.replace(/[^/]+$/, name);
     const failing = publisher(orm.em, sqs, missing.href);
+    const databaseTime = async () => new Date((await orm.em.execute<{ at: string }[]>('SELECT clock_timestamp() AS at'))[0]!.at).getTime();
     let previous = 0;
     for (const [attempts, backoff] of [[1, 1000], [2, 2000], [3, 2000]] as const) {
-      const started = Date.now();
-      expect(await failing.publishBatch()).toBe(1);
+      const started = await databaseTime();
+      setSystemTime(started + 2 * 86_400_000);
+      expect(await failing.publishBatch().finally(() => setSystemTime())).toBe(1);
       const record = await row(eventId);
       expect(record).toMatchObject({ attempts, lastErrorCode: expect.any(String) });
       expect(record.publishedAt ?? null).toBeNull();
       expect(record.failedAt ?? null).toBeNull();
       const next = record.nextAttemptAt!.getTime();
       expect(next).toBeGreaterThanOrEqual(Math.max(started + backoff, previous));
-      expect(next).toBeLessThanOrEqual(Date.now() + backoff);
-      expect(await failing.publishBatch()).toBe(0);
+      expect(next).toBeLessThanOrEqual(await databaseTime() + backoff);
+      expect(await publisher(peer.em, sqs, missing.href).publishBatch()).toBe(0);
       previous = next;
       await orm.em.execute(`UPDATE ${table} SET next_attempt_at = now() WHERE id = ?`, [eventId]);
     }
     const destination = await createQueue(name);
-    expect(await publisher(peer.em, sqs, destination).publishBatch()).toBe(1);
+    const beforePublication = await databaseTime();
+    setSystemTime(beforePublication - 2 * 86_400_000);
+    expect(await publisher(peer.em, sqs, destination).publishBatch().finally(() => setSystemTime())).toBe(1);
     expect(body((await receive(1, destination))[0]!).eventId).toBe(eventId);
-    expect(await row(eventId)).toMatchObject({ attempts: 4, publishedAt: expect.any(Date) });
+    const published = await row(eventId);
+    expect(published.attempts).toBe(4);
+    const publishedAt = published.publishedAt!.getTime();
+    expect(publishedAt).toBeGreaterThanOrEqual(beforePublication);
+    expect(publishedAt).toBeLessThanOrEqual(await databaseTime());
+    const after = processingMetrics.render();
+    expect(Number(retries.exec(after)![1])).toBe(Number(retries.exec(before)![1]) + 3);
+    expect(Number(durationCount.exec(after)![1])).toBe(Number(durationCount.exec(before)![1]) + 4);
   }, 12_000);
 
   test('resends with the same identity after real SQS acceptance followed by PostgreSQL commit failure', async () => {
@@ -301,5 +327,48 @@ describe.skipIf(!databaseUrl || !endpoint)('Outbox publisher on PostgreSQL and L
     expect((await row('shutdown-next')).publishedAt ?? null).toBeNull();
     expect(await publisher(peer.em).publishBatch()).toBe(1);
     expect((await receive(2)).map((message) => body(message).eventId)).toEqual(['shutdown-current', 'shutdown-next']);
+  }, 10_000);
+
+  test('publishes an overdue retry and then its successor while fresh events keep arriving', async () => {
+    const aggregate = 'overdue-aggregate';
+    const head = 'overdue-head';
+    const successor = 'overdue-successor';
+    const occurredAt = '2000-01-01T00:00:00.000Z';
+    await seed(orm.em, head, aggregate, 1, occurredAt);
+    await seed(orm.em, successor, aggregate, 2, occurredAt);
+    await orm.em.execute(`UPDATE ${table} SET attempts = 1, next_attempt_at = occurred_at + interval '1 minute' WHERE id = ?`, [head]);
+
+    const second = publisher(peer.em, sqs, queue, 1);
+    for (let round = 0; round < 3; round++) {
+      await seed(orm.em, `fresh-${round}-a`);
+      await seed(orm.em, `fresh-${round}-b`);
+
+      const transport = client();
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      captureSends(transport, async () => { entered.resolve(); await release.promise; });
+      const first = publisher(orm.em, transport, queue, 1).publishBatch();
+      try {
+        await Promise.race([entered.promise, first.then(() => { throw new Error('Expected a selected event.'); })]);
+        expect(await second.publishBatch()).toBe(1);
+      } finally {
+        release.resolve();
+        try {
+          expect(await first).toBe(1);
+        } finally {
+          transport.destroy();
+        }
+      }
+    }
+
+    const messages = (await receive(6)).map(body);
+    expect({
+      deliveredInAggregate: messages.filter(({ aggregateId }) => aggregateId === aggregate).map(({ eventId }) => eventId),
+      headAttempts: (await row(head)).attempts,
+      successorAttempts: (await row(successor)).attempts,
+    }).toEqual({ deliveredInAggregate: [head, successor], headAttempts: 2, successorAttempts: 1 });
+    expect(new Set(messages.map(({ eventId }) => eventId)).size).toBe(6);
+    expect((await row(head)).publishedAt).toBeInstanceOf(Date);
+    expect((await row(successor)).publishedAt).toBeInstanceOf(Date);
   }, 10_000);
 });

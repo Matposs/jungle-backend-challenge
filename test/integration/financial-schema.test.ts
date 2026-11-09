@@ -12,6 +12,8 @@ import {
   WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord,
 } from '../../src/infrastructure/database/financial-records.js';
 import { Migration20261107000100_FinancialSchema } from '../../src/infrastructure/database/migrations/Migration20261107000100_FinancialSchema.js';
+import { Migration20261107000500_WagerImmutability } from '../../src/infrastructure/database/migrations/Migration20261107000500_WagerImmutability.js';
+import { Migration20261107000600_WalletScopedReversalReservations } from '../../src/infrastructure/database/migrations/Migration20261107000600_WalletScopedReversalReservations.js';
 import { financialTestConfig } from './financial-test-config.js';
 
 const databaseUrl = process.env.FINANCIAL_TEST_DATABASE_URL;
@@ -19,7 +21,11 @@ const databaseUrl = process.env.FINANCIAL_TEST_DATABASE_URL;
 describe.skipIf(!databaseUrl)('financial schema on PostgreSQL', () => {
   const schema = `financial_test_${crypto.randomUUID().replaceAll('-', '')}`;
   const migrationName = 'Migration20261107000100_FinancialSchema';
+  const immutabilityMigration = 'Migration20261107000500_WagerImmutability';
+  const reservationsMigration = 'Migration20261107000600_WalletScopedReversalReservations';
+  const migrations = [migrationName, immutabilityMigration, reservationsMigration];
   const financialTables = ['wager_transactions', 'wallet_ledger_entries', 'wallets'];
+  const wagers = `"${schema}".wager_transactions`;
   let orm: MikroORM;
 
   function sql<T extends Record<string, unknown>[] = Record<string, unknown>[]>(
@@ -39,18 +45,24 @@ describe.skipIf(!databaseUrl)('financial schema on PostgreSQL', () => {
     const config = financialTestConfig(databaseUrl!, schema);
     orm = await MikroORM.init({
       ...config,
-      migrations: { ...config.migrations, migrationsList: [Migration20261107000100_FinancialSchema] },
+      migrations: {
+        ...config.migrations,
+        migrationsList: [
+          Migration20261107000100_FinancialSchema, Migration20261107000500_WagerImmutability,
+          Migration20261107000600_WalletScopedReversalReservations,
+        ],
+      },
     });
     expect(await sql('SELECT current_database() AS name')).toEqual([{ name: config.dbName }]);
-    expect((await orm.migrator.getPending()).map(({ name }) => name)).toEqual([migrationName]);
-    await orm.migrator.up();
+    expect((await orm.migrator.getPending()).map(({ name }) => name)).toEqual(migrations);
+    await orm.migrator.up({ to: migrationName });
     expect(await schemaTables()).toEqual(['mikro_orm_migrations', ...financialTables]);
     expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual([migrationName]);
     await orm.migrator.down();
     expect(await schemaTables()).toEqual(['mikro_orm_migrations']);
     expect(await sql('SELECT to_regprocedure(?) AS entry', [`${schema}.reject_wallet_ledger_mutation()`]))
       .toEqual([{ entry: null }]);
-    expect((await orm.migrator.getPending()).map(({ name }) => name)).toEqual([migrationName]);
+    expect((await orm.migrator.getPending()).map(({ name }) => name)).toEqual(migrations);
     await orm.migrator.up();
   });
 
@@ -107,7 +119,60 @@ describe.skipIf(!databaseUrl)('financial schema on PostgreSQL', () => {
   test('applies, reverts and reapplies the versioned schema', async () => {
     expect(await schemaTables()).toEqual(['mikro_orm_migrations', ...financialTables]);
     expect(await orm.migrator.getPending()).toHaveLength(0);
-    expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual([migrationName]);
+    expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual(migrations);
+  });
+
+  test('reverts and reapplies the wager protection without rewriting existing data', async () => {
+    const walletId = 'immutability-migration';
+    await wallet(walletId);
+    const id = 'existing-loss';
+    await transaction(id, walletId, {
+      kind: 'LOSS', status: 'PROCESSED', observed_balance: '10.00', finalized_at: '2026-01-01T00:00:00Z',
+    });
+    const existing = await sql(`SELECT * FROM ${wagers} WHERE id = ?`, [id]);
+    const guard = `${schema}.reject_wager_immutable_changes()`;
+
+    expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([reservationsMigration]);
+    expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([immutabilityMigration]);
+    expect(await sql('SELECT to_regprocedure(?) AS entry', [guard])).toEqual([{ entry: null }]);
+    expect(await sql(`SELECT * FROM ${wagers} WHERE id = ?`, [id])).toEqual(existing);
+    expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([immutabilityMigration, reservationsMigration]);
+    await expect(sql(`UPDATE ${wagers} SET observed_balance = '9.99' WHERE id = ?`, [id]))
+      .rejects.toMatchObject({ code: '55000' });
+    expect(await sql(`SELECT * FROM ${wagers} WHERE id = ?`, [id])).toEqual(existing);
+  });
+
+  test('protects wager identity and terminal outcomes while allowing pending transitions and scheduling', async () => {
+    const walletId = 'wager-immutability';
+    await wallet(walletId);
+    const pending = 'immutable-pending';
+    await transaction(pending, walletId, { kind: 'WIN', reference_external_transaction_id: 'late-bet' });
+    for (const change of ["provider_id = 'another-provider'", "external_transaction_id = 'other-external'",
+      "idempotency_key = 'other-key'", "payload_hash = 'other-hash'", "reference_external_transaction_id = 'other-bet'",
+      "amount = '2.51'"]) {
+      await expect(sql(`UPDATE ${wagers} SET ${change} WHERE id = ?`, [pending])).rejects.toMatchObject({ code: '55000' });
+    }
+    await sql(`UPDATE ${wagers} SET status = 'PENDING_REFERENCE', reference_attempts = 1,
+      reference_next_attempt_at = now() WHERE id = ?`, [pending]);
+    await sql(`UPDATE ${wagers} SET status = 'REJECTED', failure_code = 'REFERENCE_NOT_FOUND',
+      finalized_at = now(), reference_attempts = 2, reference_next_attempt_at = NULL WHERE id = ?`, [pending]);
+    expect(await sql(`SELECT status, failure_code, reference_attempts, reference_next_attempt_at FROM ${wagers} WHERE id = ?`, [pending]))
+      .toEqual([{ status: 'REJECTED', failure_code: 'REFERENCE_NOT_FOUND', reference_attempts: 2, reference_next_attempt_at: null }]);
+
+    for (const status of ['PROCESSED', 'REJECTED', 'FAILED']) {
+      const id = `immutable-${status}`;
+      await transaction(id, walletId, {
+        kind: 'LOSS', status, failure_code: status === 'PROCESSED' ? null : 'ORIGINAL_FAILURE',
+        observed_balance: '10.00', finalized_at: '2026-01-01T00:00:00Z',
+      });
+      const original = await sql(`SELECT * FROM ${wagers} WHERE id = ?`, [id]);
+      for (const change of ["status = 'PENDING', finalized_at = NULL, failure_code = NULL, observed_balance = NULL",
+        "observed_balance = '9.99'", 'finalized_at = now()', "created_at = '2000-01-01T00:00:00Z'",
+        ...(status === 'PROCESSED' ? [] : ["failure_code = 'OTHER_FAILURE'"])]) {
+        await expect(sql(`UPDATE ${wagers} SET ${change} WHERE id = ?`, [id])).rejects.toMatchObject({ code: '55000' });
+      }
+      expect(await sql(`SELECT * FROM ${wagers} WHERE id = ?`, [id])).toEqual(original);
+    }
   });
 
   test('rejects duplicate wallets for a player and currency', async () => {
@@ -177,7 +242,7 @@ describe.skipIf(!databaseUrl)('financial schema on PostgreSQL', () => {
     });
   });
 
-  test('reserves unresolved reversals atomically by provider, reference and kind', async () => {
+  test('reserves unresolved reversals atomically by provider, wallet, reference and kind', async () => {
     const walletId = 'unresolved-reversal';
     await wallet(walletId);
     const pending = { kind: 'REFUND', status: 'PENDING_REFERENCE', reference_external_transaction_id: 'late-bet' };
@@ -197,6 +262,33 @@ describe.skipIf(!databaseUrl)('financial schema on PostgreSQL', () => {
         WHERE id IN ('refund-first', 'refund-second')`,
     );
     await transaction('refund-replacement', walletId, pending);
+  });
+
+  test('reverts and reapplies wallet-scoped reversal reservations without rewriting wagers', async () => {
+    const first = 'reservation-migration-first';
+    const second = 'reservation-migration-second';
+    await wallet(first);
+    await wallet(second);
+    const pending = { kind: 'REFUND', status: 'PENDING_REFERENCE', reference_external_transaction_id: 'reservation-migration-bet' };
+    await transaction(first, first, pending);
+    await transaction(second, second, pending);
+    const rows = () => sql(`SELECT * FROM ${wagers} WHERE id IN (?, ?) ORDER BY id`, [first, second]);
+    const duplicate = { code: '23505', constraint: 'wager_reversal_reference_unique' };
+    const before = await rows();
+
+    await expect(orm.migrator.down()).rejects.toMatchObject({ code: '23505' });
+    expect((await orm.migrator.getExecuted()).map(({ name }) => name)).toEqual(migrations);
+    expect(await rows()).toEqual(before);
+    await expect(transaction('reservation-migration-duplicate', second, pending)).rejects.toMatchObject(duplicate);
+
+    await sql(`UPDATE ${wagers} SET status = 'REJECTED', failure_code = 'INVALID_REFERENCE', finalized_at = now()
+      WHERE id = ?`, [second]);
+    const after = await rows();
+    expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([reservationsMigration]);
+    await expect(transaction('reservation-migration-replacement', second, pending)).rejects.toMatchObject(duplicate);
+    expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([reservationsMigration]);
+    expect(await rows()).toEqual(after);
+    await transaction('reservation-migration-replacement', second, pending);
   });
 
   test('checks transaction state shape and reference scheduling fields', async () => {

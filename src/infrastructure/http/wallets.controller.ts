@@ -1,6 +1,8 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, Inject, Param, Post, Query, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { FinancialQueries } from '../../application/financial-queries.js';
-import { OpenWallet, WalletAlreadyExistsError } from '../../application/open-wallet.js';
+import { OpenWallet, WalletAlreadyExistsError, WalletOpeningUnavailableError } from '../../application/open-wallet.js';
+import { hasUnsupportedSqsJsonCharacters } from '../../application/parse-wager.js';
+import { ReconcileWallet } from '../../application/reconcile-wallet.js';
 import { Money, MoneyError, type MoneyProps } from '../../domain/money.js';
 import { FinancialQueryAccessGuard } from './financial-query-access.guard.js';
 import { decodeLedgerCursor, encodeLedgerCursor, ledgerEntryResponse, ledgerLimit, queryId, requireQueryResult, walletResponse } from './financial-query-contracts.js';
@@ -9,6 +11,9 @@ function parseOpeningRequest(body: unknown): { playerId: string; initialBalance:
   if (body === null || typeof body !== 'object' || !('playerId' in body) ||
       typeof body.playerId !== 'string' || !body.playerId.trim() || body.playerId.includes('\0')) {
     throw new BadRequestException('playerId must be a non-blank string without NUL characters.');
+  }
+  if (hasUnsupportedSqsJsonCharacters(body.playerId)) {
+    throw new BadRequestException('playerId contains characters unsupported by SQS.');
   }
   if (!('initialBalance' in body) || body.initialBalance === null || typeof body.initialBalance !== 'object') {
     throw new BadRequestException('initialBalance must contain amount and currency.');
@@ -33,6 +38,7 @@ export class WalletsController {
   constructor(
     @Inject(OpenWallet) private readonly openWallet: OpenWallet,
     @Inject(FinancialQueries) private readonly queries: FinancialQueries,
+    @Inject(ReconcileWallet) private readonly reconcileWallet: ReconcileWallet,
   ) {}
 
   @Get(':walletId')
@@ -60,6 +66,14 @@ export class WalletsController {
     };
   }
 
+  @Post(':walletId/reconciliation')
+  @HttpCode(200)
+  @UseGuards(FinancialQueryAccessGuard)
+  async reconcile(@Param('walletId') walletId: string) {
+    const id = queryId(walletId, 'walletId');
+    return requireQueryResult(() => this.reconcileWallet.execute(id), 'Wallet not found.');
+  }
+
   @Post()
   async open(@Body() body: unknown): Promise<{ id: string; playerId: string; balance: MoneyProps; version: number }> {
     const { playerId, initialBalance } = parseOpeningRequest(body);
@@ -69,6 +83,7 @@ export class WalletsController {
       return walletResponse(wallet);
     } catch (error) {
       if (error instanceof WalletAlreadyExistsError) throw new ConflictException(error.message);
+      if (error instanceof WalletOpeningUnavailableError) throw new ServiceUnavailableException(error.message);
       throw error;
     }
   }

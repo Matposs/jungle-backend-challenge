@@ -9,6 +9,19 @@ export function requiredText(value: unknown, field: string): string {
   return value;
 }
 
+export function hasUnsupportedSqsJsonCharacters(value: string): boolean {
+  // JSON.stringify escapes control characters and lone surrogates, but emits U+FFFE and U+FFFF literally.
+  return /[\uFFFE\uFFFF]/u.test(value);
+}
+
+function requiredEventText(value: unknown, field: string): string {
+  const text = requiredText(value, field);
+  if (hasUnsupportedSqsJsonCharacters(text)) {
+    throw new InvalidWagerInputError(`${field} contains characters unsupported by SQS.`);
+  }
+  return text;
+}
+
 export function parseWager(body: unknown, idempotencyKey: unknown): SubmitWagerInput {
   if (!body || typeof body !== 'object' || !('kind' in body)) {
     throw new InvalidWagerInputError('kind is required.');
@@ -22,7 +35,7 @@ export function parseWager(body: unknown, idempotencyKey: unknown): SubmitWagerI
     if (kind !== Kind.Win && kind !== Kind.Refund && kind !== Kind.Rollback) {
       throw new InvalidWagerInputError(`${kind} does not support a reference.`);
     }
-    referenceExternalTransactionId = requiredText(body.referenceExternalTransactionId, 'referenceExternalTransactionId');
+    referenceExternalTransactionId = requiredEventText(body.referenceExternalTransactionId, 'referenceExternalTransactionId');
   }
 
   const payload = body as Record<string, unknown>;
@@ -35,10 +48,10 @@ export function parseWager(body: unknown, idempotencyKey: unknown): SubmitWagerI
     return {
       kind,
       referenceExternalTransactionId,
-      providerId: requiredText(payload.providerId, 'providerId'),
-      externalTransactionId: requiredText(payload.externalTransactionId, 'externalTransactionId'),
+      providerId: requiredEventText(payload.providerId, 'providerId'),
+      externalTransactionId: requiredEventText(payload.externalTransactionId, 'externalTransactionId'),
       idempotencyKey: requiredText(idempotencyKey, 'Idempotency-Key'),
-      playerId: requiredText(payload.playerId, 'playerId'),
+      playerId: requiredEventText(payload.playerId, 'playerId'),
       walletId: requiredText(payload.walletId, 'walletId'),
       roundId: requiredText(payload.roundId, 'roundId'),
       gameId: requiredText(payload.gameId, 'gameId'),

@@ -1,5 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { PendingReferenceAttemptError, type PostgresWagerStore } from './postgres-wager-store.js';
+import { logEvent } from '../observability/log.js';
+import { processingMetrics } from '../observability/processing-metrics.js';
 
 const FAILURE_COOLDOWN_MS = 5000;
 
@@ -18,7 +20,8 @@ export class PendingReferenceWorker {
       try {
         await this.processBatch();
       } catch {
-        console.error(JSON.stringify({ event: 'pending_reference_batch_failed' }));
+        processingMetrics.increment('retries', 'references');
+        logEvent({ event: 'pending_reference_batch_failed' });
       }
 
       try {
@@ -43,7 +46,7 @@ export class PendingReferenceWorker {
         if (!(error instanceof PendingReferenceAttemptError)) throw error;
         excludedIds.push(error.transactionId);
         this.#retryAfter.set(error.transactionId, performance.now() + FAILURE_COOLDOWN_MS);
-        console.error(JSON.stringify({ event: 'pending_reference_attempt_failed', transactionId: error.transactionId }));
+        processingMetrics.increment('retries', 'references');
       }
     }
   }

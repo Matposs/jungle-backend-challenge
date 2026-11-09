@@ -4,7 +4,7 @@ import {
   type IntegrationEvent,
 } from '../domain/integration-events.js';
 import { MoneyError, type Money } from '../domain/money.js';
-import { WagerTransaction, WagerTransactionError, WagerTransactionKind as Kind, WagerTransactionStatus as Status } from '../domain/wager-transaction.js';
+import { WagerTransactionError, WagerTransactionKind as Kind, WagerTransactionStatus as Status, type CreateWagerTransactionProps, type WagerTransaction } from '../domain/wager-transaction.js';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/wallet-ledger-entry.js';
 import { InsufficientFundsError, type Wallet } from '../domain/wallet.js';
 
@@ -32,17 +32,17 @@ export interface WagerEffects {
 }
 
 export type ApplyWager = typeof applyWager;
+export type WagerSubmission = Omit<CreateWagerTransactionProps, 'createdAt'>;
 
 export interface WagerStore {
-  submit(transaction: WagerTransaction, apply: ApplyWager): Promise<WagerResult>;
-  submit(transaction: WagerTransaction, apply: ApplyWager, delivery: InboxDelivery): Promise<WagerResult | undefined>;
+  submit(submission: WagerSubmission, apply: ApplyWager): Promise<WagerResult>;
+  submit(submission: WagerSubmission, apply: ApplyWager, delivery: InboxDelivery): Promise<WagerResult | undefined>;
 }
 
 export interface InboxDelivery {
   readonly consumerName: string;
   readonly messageId: string;
   readonly payloadHash: string;
-  readonly receivedAt: Date;
 }
 
 export class InboxPayloadConflictError extends Error {}
@@ -88,11 +88,11 @@ export class SubmitWager {
       roundId: input.roundId,
       walletId: input.walletId,
     })).digest('hex');
-    const transaction = WagerTransaction.create({
+    const submission = {
       ...input, id: crypto.randomUUID(), payloadHash,
-    });
+    };
 
-    return delivery ? this.store.submit(transaction, applyWager, delivery) : this.store.submit(transaction, applyWager);
+    return delivery ? this.store.submit(submission, applyWager, delivery) : this.store.submit(submission, applyWager);
   }
 }
 
@@ -101,7 +101,7 @@ export async function applyWager(
   transaction: WagerTransaction,
   reference: WagerTransaction | undefined,
   hasCompetingBetReversal: () => Promise<boolean>,
-  at = new Date(),
+  at: Date,
   referenceDeadline?: number,
 ): Promise<WagerEffects> {
   if (wallet.playerId !== transaction.playerId || wallet.currency !== transaction.currency) {

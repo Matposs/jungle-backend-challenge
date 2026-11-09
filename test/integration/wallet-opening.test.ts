@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, setSystemTime, test } from 'bun:test';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { Module, type INestApplication } from '@nestjs/common';
@@ -104,7 +104,11 @@ describe.skipIf(!databaseUrl)('POST /wallets on PostgreSQL', () => {
   test('persists OPENING, CREDIT and both versioned events with exact balances', async () => {
     const playerId = 'positive-player';
     const money = { amount: '9007199254740993.01', currency: 'BRL' };
-    const response = await post({ playerId, initialBalance: money });
+    const databaseTime = async () => new Date((await orm.em.execute<{ at: string }[]>('SELECT clock_timestamp() AS at'))[0]!.at).getTime();
+    const before = await databaseTime();
+    setSystemTime(before - 2 * 86_400_000);
+    const response = await post({ playerId, initialBalance: money }).finally(() => setSystemTime());
+    const after = await databaseTime();
     const body = await response.json() as WalletResponse;
     const em = orm.em.fork();
 
@@ -114,6 +118,11 @@ describe.skipIf(!databaseUrl)('POST /wallets on PostgreSQL', () => {
     const transaction = await em.findOneOrFail(WagerTransactionRecord, { walletId: wallet.id });
     const entry = await em.findOneOrFail(WalletLedgerEntryRecord, { transactionId: transaction.id });
     expect(wallet).toMatchObject({ balance: money.amount, version: 1 });
+    expect(wallet.createdAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(wallet.createdAt.getTime()).toBeLessThanOrEqual(after);
+    expect(wallet.updatedAt).toEqual(wallet.createdAt);
+    expect(transaction.createdAt).toEqual(wallet.createdAt);
+    expect(entry.createdAt).toEqual(wallet.createdAt);
     expect(transaction).toMatchObject({
       providerId: 'internal:wallet-opening', externalTransactionId: `opening:${wallet.id}`, idempotencyKey: `opening:${wallet.id}`,
       kind: WagerTransactionKind.Opening, status: WagerTransactionStatus.Processed, amount: money.amount,
@@ -211,6 +220,31 @@ describe.skipIf(!databaseUrl)('POST /wallets on PostgreSQL', () => {
       await orm.em.execute(`DROP FUNCTION ${failure}()`);
     }
     expect((await open(playerId, '25.00')).status).toBe(201);
+  });
+
+  test('returns 503 after PostgreSQL disconnects during commit and recovers without duplicate opening', async () => {
+    const playerId = 'disconnect-opening-player';
+    const before = await counts();
+    const failure = `"${schema}".disconnect_opening`;
+    await orm.em.execute(`CREATE FUNCTION ${failure}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); RETURN NULL; END; $$`);
+    await orm.em.execute(`CREATE CONSTRAINT TRIGGER disconnect_opening AFTER INSERT ON ${outboxTable}
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+      WHEN (NEW.payload->'data'->>'playerId' = 'disconnect-opening-player') EXECUTE FUNCTION ${failure}()`);
+    try {
+      const interrupted = await open(playerId, '25.00');
+      expect(await counts()).toEqual(before);
+      expect(interrupted.status).toBe(503);
+      expect(await interrupted.json()).toMatchObject({ message: 'Wallet opening is temporarily unavailable.' });
+    } finally {
+      await orm.em.execute(`DROP TRIGGER disconnect_opening ON ${outboxTable}`);
+      await orm.em.execute(`DROP FUNCTION ${failure}()`);
+    }
+
+    const responses = await Promise.all([open(playerId, '25.00'), open(playerId, '25.00')]);
+    expect(responses.map(({ status }) => status).sort()).toEqual([201, 409]);
+    const [wallets, transactions, entries, events] = before;
+    expect(await counts()).toEqual([wallets + 1, transactions + 1, entries + 1, events + 2]);
   });
 
   test('allows concurrent database transactions to skip locked pending events', async () => {

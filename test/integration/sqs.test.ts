@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { createHash } from 'node:crypto';
 import {
   CreateQueueCommand, DeleteMessageCommand, DeleteQueueCommand, GetQueueAttributesCommand, GetQueueUrlCommand,
   ReceiveMessageCommand, SendMessageCommand, SQSClient, type Message,
@@ -16,11 +17,14 @@ import { OutboxRecord } from '../../src/infrastructure/database/outbox-record.js
 import { PostgresWagerStore } from '../../src/infrastructure/database/postgres-wager-store.js';
 import { WageringModule } from '../../src/infrastructure/http/wagering.module.js';
 import { WalletsModule } from '../../src/infrastructure/http/wallets.module.js';
+import { processingMetrics } from '../../src/infrastructure/observability/processing-metrics.js';
 import { WagerConsumer, WAGER_CONSUMER_NAME } from '../../src/infrastructure/sqs/wager-consumer.js';
 import { financialTestConfig } from './financial-test-config.js';
 
 const databaseUrl = process.env.FINANCIAL_TEST_DATABASE_URL;
 const endpoint = process.env.FINANCIAL_TEST_SQS_ENDPOINT;
+// AWS SendMessage applies these Unicode ranges to the serialized MessageBody.
+const UNSUPPORTED_SQS_BODY_CHARACTER = /[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/u;
 type Entry = Readonly<Record<string, unknown>>;
 
 function testSqs() {
@@ -161,6 +165,78 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
     return message;
   }
 
+  test('rejects SQS-incompatible identifiers before committing over HTTP or SQS', async () => {
+    const wallet = await open('sqs-invalid-identifier');
+    const before = await snapshot(wallet.id);
+    const message = envelope(wallet, 'invalid-identifier');
+    message.data.externalTransactionId = 'external-\uFFFE';
+
+    const response = await http(message);
+    // Inspect the body the publisher would send if HTTP regresses and enqueues the event.
+    const afterHttp = await snapshot(wallet.id);
+    for (const event of afterHttp.events) {
+      expect(JSON.stringify(event.payload)).not.toMatch(UNSUPPORTED_SQS_BODY_CHARACTER);
+    }
+    expect(response.status).toBe(400);
+    expect(afterHttp).toEqual(before);
+
+    const invalidPlayer = await fetch(`${url}/wallets`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ playerId: 'player-\uFFFF', initialBalance: { amount: '100.00', currency: 'BRL' } }),
+    });
+    expect(invalidPlayer.status).toBe(400);
+    expect(await orm.em.fork().findOne(WalletRecord, { playerId: 'player-\uFFFF' })).toBeNull();
+    expect(await orm.em.fork().count(OutboxRecord, { payload: { data: { playerId: 'player-\uFFFF' } } })).toBe(0);
+
+    // The JSON escape travels through SQS as ASCII and decodes to U+FFFE in the consumer.
+    const body = JSON.stringify(message).replaceAll('\uFFFE', '\\ufffe');
+    await send(body, wallet.id);
+    const worker = start();
+    try {
+      const delivery = await readDlq();
+      expect(delivery.Body).toBe(body);
+      expect(worker.logs).toContainEqual(expect.objectContaining({
+        event: 'sqs_permanent_failure', reason: 'INVALID_MESSAGE', committed: false,
+      }));
+      expect(await inbox(message.messageId)).toBeNull();
+      expect(await snapshot(wallet.id)).toEqual(before);
+    } finally { await worker.close(); }
+  }, 15_000);
+
+  test('preserves Unicode identifiers and replay across HTTP and SQS', async () => {
+    const wallet = await open('sqs-valid-unicode');
+    const message = envelope(wallet, 'valid-unicode');
+    const externalTransactionId = '  cafe\u0301-\uFFFD-\u{10000}-\u{10FFFF}-\u0001  ';
+    message.data.externalTransactionId = externalTransactionId;
+
+    const response = await http(message);
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    const before = await snapshot(wallet.id);
+    const wager = before.wagers.find(({ id }) => id === result.transactionId)!;
+    expect(wager.externalTransactionId).toBe(externalTransactionId);
+    expect(wager.payloadHash).toBe(createHash('sha256').update(JSON.stringify({
+      externalTransactionId,
+      gameId: message.data.gameId,
+      kind: message.data.kind,
+      money: message.data.money,
+      playerId: wallet.playerId,
+      providerId: message.data.providerId,
+      roundId: message.data.roundId,
+      walletId: wallet.id,
+    })).digest('hex'));
+    const event = before.events.find(({ aggregateId }) => aggregateId === wager.id)!;
+    expect(event.payload.data).toMatchObject({ externalTransactionId });
+    expect(JSON.stringify(event.payload)).not.toMatch(UNSUPPORTED_SQS_BODY_CHARACTER);
+
+    const worker = start();
+    try {
+      await send(message);
+      expect(await worker.ack(message.messageId)).toMatchObject({ duplicate: true, transactionId: wager.id });
+      expect(await snapshot(wallet.id)).toEqual(before);
+    } finally { await worker.close(); }
+  }, 15_000);
+
   test('bootstraps the official FIFO source and its FIFO redrive policy', async () => {
     const source = await sqs.send(new GetQueueUrlCommand({ QueueName: 'wager-transactions.fifo' }));
     const deadLetter = await sqs.send(new GetQueueUrlCommand({ QueueName: 'wager-transactions-dlq.fifo' }));
@@ -235,6 +311,71 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
     } finally { await worker.close(); }
   }, 15_000);
 
+  test('recovers a valid REFUND from the legacy DLQ and deduplicates delivery after a failed ACK', async () => {
+    const wrongWallet = await open('sqs-wrong-reservation');
+    const owner = await open('sqs-reservation-owner');
+    const source = envelope(owner, 'sqs-late-reserved-bet');
+    const wrong = envelope(wrongWallet, 'sqs-wrong-refund', 'REFUND', '20.00', source.data.externalTransactionId);
+    const valid = envelope(owner, 'sqs-valid-refund', 'REFUND', '20.00', source.data.externalTransactionId);
+    expect((await http(wrong)).status).toBe(202);
+    expect((await http(source)).status).toBe(200);
+
+    const migration = 'Migration20261107000600_WalletScopedReversalReservations';
+    expect((await orm.migrator.down({ migrations: [migration] })).map(({ name }) => name)).toEqual([migration]);
+    const legacy = start();
+    let body: string;
+    try {
+      await send(valid);
+      const dead = await readDlq();
+      body = dead.Body!;
+      expect(body).toBe(JSON.stringify(valid));
+      expect(legacy.logs).toContainEqual(expect.objectContaining({
+        event: 'sqs_permanent_failure', reason: 'DUPLICATE_REFUND', committed: false,
+      }));
+      expect(await inbox(valid.messageId)).toBeNull();
+      expect((await snapshot(owner.id)).wallet).toMatchObject({ balance: '80.00', version: 2 });
+    } finally {
+      await legacy.close();
+      expect((await orm.migrator.up({ migrations: [migration] })).map(({ name }) => name)).toEqual([migration]);
+    }
+
+    const brokenAck = testSqs();
+    brokenAck.middlewareStack.add((next, context) => async (args) => {
+      if (context.commandName === 'DeleteMessageCommand') throw new Error('Simulated ACK failure');
+      return next(args);
+    }, { step: 'initialize' });
+    const first = start(brokenAck, app.get(SubmitWager), (entry, stop) => {
+      if (entry.event === 'sqs_retry') stop();
+    });
+    let committed: Awaited<ReturnType<typeof snapshot>>;
+    try {
+      await send(body, owner.id);
+      const outcome = await until(() => first.logs.find((entry) => entry.event === 'sqs_retry'));
+      expect(outcome).toMatchObject({ messageId: valid.messageId, committed: true });
+      await first.done;
+      expect(await inbox(valid.messageId)).toMatchObject({ processedAt: expect.any(Date) });
+      committed = await snapshot(owner.id);
+      expect(committed.wallet).toMatchObject({ balance: '100.00', version: 3 });
+      expect(committed.wagers.filter(({ kind }) => kind === 'REFUND')).toEqual([
+        expect.objectContaining({ status: 'PROCESSED', externalTransactionId: valid.data.externalTransactionId }),
+      ]);
+      expect(committed.ledger).toHaveLength(3);
+      expect(committed.events).toHaveLength(6);
+    } finally { await first.close(); brokenAck.destroy(); }
+
+    const retry = start(sqs, new SubmitWager(new PostgresWagerStore(peer.em)));
+    try {
+      expect(await retry.ack(valid.messageId)).toMatchObject({ receiveCount: 2, duplicate: true });
+      expect(await snapshot(owner.id)).toEqual(committed);
+      const other = await snapshot(wrongWallet.id);
+      expect(other.wallet).toMatchObject({ balance: '100.00', version: 1 });
+      expect(other.wagers).toContainEqual(expect.objectContaining({ kind: 'REFUND', status: 'PENDING_REFERENCE' }));
+      expect(other.ledger).toHaveLength(1);
+      const dead = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlq, WaitTimeSeconds: 1 }));
+      expect(dead.Messages ?? []).toEqual([]);
+    } finally { await retry.close(); }
+  }, 15_000);
+
   test('rolls back Inbox and all effects when PostgreSQL fails at commit, then processes on redelivery', async () => {
     const wallet = await open('sqs-before-commit');
     const message = envelope(wallet, 'sqs-commit-error');
@@ -269,6 +410,9 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
   test('does not repeat effects on actual redelivery after an ACK failure following commit', async () => {
     const wallet = await open('sqs-after-commit');
     const message = envelope(wallet, 'sqs-ack-error');
+    const retries = /processing_retries_total\{component="sqs"\} (\d+)/;
+    const duplicates = /wager_duplicates_total\{component="sqs"\} (\d+)/;
+    const before = processingMetrics.render();
     const brokenAck = testSqs();
     brokenAck.middlewareStack.add((next, context) => async (args) => {
       if (context.commandName === 'DeleteMessageCommand') throw new Error('Simulated ACK failure');
@@ -277,7 +421,13 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
     const failing = start(brokenAck, app.get(SubmitWager), (entry, stop) => { if (entry.event === 'sqs_retry') stop(); });
     try {
       await send(message);
-      await until(() => failing.logs.find((entry) => entry.event === 'sqs_retry' && entry.committed === true));
+      const failure = await until(() => failing.logs.find((entry) => entry.event === 'sqs_retry' && entry.committed === true));
+      expect(failure.correlationId).toBe(failure.transactionId);
+      expect(JSON.stringify(failure)).not.toContain('Simulated ACK failure');
+      expect(failure).toMatchObject({
+        messageId: message.messageId, walletId: wallet.id, providerId: message.data.providerId,
+        correlationId: expect.any(String), transactionId: expect.any(String),
+      });
       await failing.done;
       expect(await inbox(message.messageId)).toMatchObject({ processedAt: expect.any(Date) });
       expect((await snapshot(wallet.id)).wallet.balance).toBe('80.00');
@@ -289,6 +439,9 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
       expect(after.wallet).toMatchObject({ balance: '80.00', version: 2 });
       expect([after.wagers.length, after.ledger.length, after.events.length]).toEqual([2, 2, 4]);
     } finally { await retry.close(); }
+    const after = processingMetrics.render();
+    expect(Number(retries.exec(after)![1])).toBe(Number(retries.exec(before)![1]) + 1);
+    expect(Number(duplicates.exec(after)![1])).toBe(Number(duplicates.exec(before)![1]) + 1);
   }, 15_000);
 
   test('serializes competing BETs from two consumers on independent PostgreSQL connections', async () => {

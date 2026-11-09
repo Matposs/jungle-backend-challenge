@@ -1,5 +1,5 @@
 import { MikroORM } from '@mikro-orm/postgresql';
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, setSystemTime, test } from 'bun:test';
 import { OpenWallet } from '../../src/application/open-wallet.js';
 import { applyWager, SubmitWager } from '../../src/application/submit-wager.js';
 import { Money } from '../../src/domain/money.js';
@@ -9,6 +9,7 @@ import { WagerTransactionRecord, WalletLedgerEntryRecord, WalletRecord } from '.
 import { PendingReferenceWorker } from '../../src/infrastructure/database/pending-reference-worker.js';
 import { PostgresWagerStore } from '../../src/infrastructure/database/postgres-wager-store.js';
 import { PostgresWalletOpeningStore } from '../../src/infrastructure/database/postgres-wallet-opening-store.js';
+import { processingMetrics } from '../../src/infrastructure/observability/processing-metrics.js';
 import { financialTestConfig } from './financial-test-config.js';
 
 const databaseUrl = process.env.FINANCIAL_TEST_DATABASE_URL;
@@ -119,13 +120,49 @@ describe.skipIf(!databaseUrl)('Pending reference worker on PostgreSQL', () => {
     await expectBalance(wallet.id, '80.00', 4);
   });
 
+  test('keeps the pending reference TTL on PostgreSQL time across instances with divergent clocks', async () => {
+    const { wallet, submit, input } = await scenario();
+    const before = await databaseTime();
+    setSystemTime(before - 2 * dayMs);
+    try {
+      const { transaction: pending } = await submit.execute(input(Kind.Refund, 'skewed-refund', 'skewed-bet'));
+      const stored = await row(pending.id);
+      expect(stored.createdAt.getTime()).toBeGreaterThanOrEqual(before);
+      expect(stored.createdAt.getTime()).toBeLessThanOrEqual(await databaseTime());
+      expect(pending.createdAt).toEqual(stored.createdAt);
+      const [event] = await orm.em.execute<{ occurred_at: string; payload: { occurredAt: string } }[]>(
+        `SELECT occurred_at, payload FROM ${outbox} WHERE aggregate_id = ?`, [pending.id],
+      );
+      expect(new Date(event!.occurred_at)).toEqual(stored.createdAt);
+      expect(event!.payload.occurredAt).toBe(stored.createdAt.toISOString());
+
+      setSystemTime(before + 2 * dayMs);
+      await worker(orm).processBatch();
+      const rescheduled = await row(pending.id);
+      expect(rescheduled).toMatchObject({ status: Status.PendingReference, referenceAttempts: 1 });
+      expect(rescheduled.referenceNextAttemptAt!.getTime()).toBeGreaterThanOrEqual(stored.createdAt.getTime() + 5000);
+      expect(rescheduled.referenceNextAttemptAt!.getTime()).toBeLessThanOrEqual(await databaseTime() + 5000);
+
+      await submit.execute(input(Kind.Bet, 'skewed-bet'));
+      await makeDue(pending.id);
+      await worker(orm).processBatch();
+      const processed = await row(pending.id);
+      expect(processed).toMatchObject({ status: Status.Processed, referenceAttempts: 2 });
+      expect(processed.finalizedAt!.getTime()).toBeLessThanOrEqual(await databaseTime());
+      await expectBalance(wallet.id, '100.00', 3);
+    } finally { setSystemTime(); }
+  });
+
   test('reschedules a ROLLBACK of a pending WIN and resolves the chain after worker restart', async () => {
     const { wallet, submit, input } = await scenario();
     const { transaction: rollback } = await submit.execute(input(Kind.Rollback, 'rollback', 'win'));
     const { transaction: win } = await submit.execute(input(Kind.Win, 'win', 'bet'));
     const first = worker();
+    const retries = /processing_retries_total\{component="references"\} (\d+)/;
+    const before = Number(retries.exec(processingMetrics.render())![1]);
     await first.processBatch();
     first.stop();
+    expect(Number(retries.exec(processingMetrics.render())![1])).toBe(before + 2);
     expect(await row(rollback.id)).toMatchObject({
       status: Status.PendingReference, referenceAttempts: 1, referenceNextAttemptAt: expect.any(Date),
     });

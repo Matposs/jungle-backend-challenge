@@ -744,3 +744,129 @@ wallet.balance == saldo reconstruído pelo ledger
 ### Diferenciais opcionais
 
 Teste de carga também conta como diferencial. Se fizer, exponha como `bun run test:load` e registre ambiente, metodologia, throughput, p50/p95/p99, taxa de erro, conflitos de concorrência e outbox lag. Não há meta de RPS — a qualidade do experimento e a honestidade da análise pesam mais que o número bruto.
+
+---
+
+## Execução local da solução
+
+Execute os comandos a partir da raiz do repositório, em Bash, com Bun **1.4.4**, Docker com Compose e suporte a `up --wait`, `curl` e `openssl`. O Compose usa `postgres:17-alpine` e `localstack/localstack:4.4.0`. O lockfile fixa NestJS **11.2.8**, MikroORM **7.2.8** e TypeScript **5.9.3**.
+
+### Preparar o ambiente
+
+Em um checkout novo, gere um `.env` local a partir do exemplo. O arquivo fica fora do Git e o comando preserva um `.env` existente.
+
+```sh
+if [ ! -e .env ]; then
+  (umask 077
+   sed -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" \
+       -e "s/^LEDGER_CURSOR_SECRET=.*/LEDGER_CURSOR_SECRET=$(openssl rand -hex 32)/" \
+       -e 's/^POSTGRES_DB=.*/POSTGRES_DB=jungle_eval_test/' .env.example > .env)
+fi
+```
+
+- `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` e `POSTGRES_PASSWORD` configuram a conexão. A senha deve corresponder à do banco provisionado. O roteiro usa um banco descartável com nome terminado em `_test` para habilitar a suíte completa.
+- `LEDGER_CURSOR_SECRET` é obrigatório para iniciar a API. Use 32 bytes aleatórios em hexadecimal e compartilhe o mesmo valor entre instâncias HTTP do ambiente.
+- `SQS_ENDPOINT` aponta para o LocalStack em `http://127.0.0.1:4566`. Se mudar `LOCALSTACK_PORT`, ajuste também `SQS_ENDPOINT`. O SDK usa `AWS_REGION`, `AWS_ACCESS_KEY_ID` e `AWS_SECRET_ACCESS_KEY`. Os valores `test` do exemplo são exclusivos do emulador. `OUTBOX_QUEUE_NAME` usa `wagering-events.fifo` por padrão.
+- `PORT` usa `3000` por padrão. Os workers expõem métricas em loopback nas portas `9465` (consumidor), `9466` (Outbox) e `9467` (referências). Use `METRICS_PORT` por processo para evitar conflito entre instâncias no mesmo host. A API assume rede confiável, conforme [ARCHITECTURE.md](ARCHITECTURE.md).
+
+### Subir dependências e aplicar migrations
+
+Use um nome de projeto Compose reservado para esta avaliação e portas livres. Os exemplos usam `jungle-eval` e as portas do `.env.example`.
+
+```sh
+bun install --frozen-lockfile
+docker compose -p jungle-eval config --quiet
+docker compose -p jungle-eval up -d --wait
+bun run migration:status
+bun run migration:up
+bun run migration:status
+bun run typecheck
+bun run build
+```
+
+O último `migration:status` deve mostrar seis migrations aplicadas e nenhuma pendente, incluindo `WagerImmutability` e `WalletScopedReversalReservations`. O hook do LocalStack cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `wagering-events.fifo`.
+
+```sh
+docker compose -p jungle-eval exec -T localstack awslocal sqs list-queues
+```
+
+### Iniciar os processos
+
+Execute cada comando em um terminal separado, na raiz do repositório. Bun carrega o `.env` local.
+
+| Processo | Comando |
+| --- | --- |
+| API HTTP | `bun run start` |
+| Consumidor SQS | `bun run sqs:consume` |
+| Publicador da Outbox | `bun run outbox:publish` |
+| Worker de referências pendentes | `bun run references:process` |
+
+```sh
+API=http://127.0.0.1:3000
+curl -fsS "$API/health/live"
+curl -fsS "$API/health/ready"
+curl -fsS "$API/metrics"
+for port in 9465 9466 9467; do
+  curl -fsS "http://127.0.0.1:$port/metrics"
+done
+```
+
+`/health/ready` deve retornar HTTP `200` com PostgreSQL e SQS disponíveis.
+
+### Exercitar uma aposta e conferir os efeitos
+
+Com os processos ativos, abra uma wallet com `100.00 BRL` e faça uma aposta de `25.00 BRL`.
+
+```sh
+API=http://127.0.0.1:3000
+PLAYER_ID="eval-$(openssl rand -hex 8)"
+BET_ID="bet-$PLAYER_ID"
+
+wallet=$(curl -fsS "$API/wallets" -H 'Content-Type: application/json' \
+  -d "{\"playerId\":\"$PLAYER_ID\",\"initialBalance\":{\"amount\":\"100.00\",\"currency\":\"BRL\"}}")
+WALLET_ID=$(printf '%s' "$wallet" | bun -e 'console.log((await Bun.stdin.json()).id)')
+bet=$(curl -fsS "$API/wagering/transactions" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: eval-provider:$BET_ID" \
+  -d "{\"providerId\":\"eval-provider\",\"externalTransactionId\":\"$BET_ID\",\"playerId\":\"$PLAYER_ID\",\"walletId\":\"$WALLET_ID\",\"roundId\":\"eval-round\",\"gameId\":\"eval-game\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}")
+printf '%s\n' "$bet"
+TX_ID=$(printf '%s' "$bet" | bun -e 'console.log((await Bun.stdin.json()).transactionId)')
+
+curl -fsS "$API/wagering/transactions/$TX_ID"
+curl -fsS "$API/wallets/$WALLET_ID"
+curl -fsS "$API/wallets/$WALLET_ID/ledger"
+curl -fsS -X POST "$API/wallets/$WALLET_ID/reconciliation"
+```
+
+A aposta deve retornar `PROCESSED` com saldo `75.00`. O ledger deve mostrar um crédito de `100.00` e um débito de `25.00`. A reconciliação deve mostrar `consistent: true`, dois lançamentos, ambos os saldos em `75.00` e diferença `0.00`.
+
+Para inspecionar os eventos no broker local, consulte a fila de saída. Correlacione os envelopes pelo `data.transactionId` retornado na aposta. O publicador registra `outbox_published` após a confirmação e a gravação do resultado. Execute a leitura da fila apenas no ambiente de avaliação, pois ela muda temporariamente a visibilidade das mensagens. Repita a leitura se os eventos da aposta ainda não aparecerem.
+
+```sh
+docker compose -p jungle-eval exec -T localstack sh -c '
+  queue=$(awslocal sqs get-queue-url --queue-name wagering-events.fifo --query QueueUrl --output text)
+  awslocal sqs receive-message --queue-url "$queue" --wait-time-seconds 5 --max-number-of-messages 10
+'
+```
+
+### Executar a suíte completa
+
+Com PostgreSQL e LocalStack ativos e o banco descartável terminado em `_test`, execute na raiz. O comando monta a URL a partir do `.env` sem imprimir a senha. A suíte usa schemas e filas próprios. Sem as duas variáveis `FINANCIAL_TEST_*`, parte dos testes de integração é pulada.
+
+```sh
+FINANCIAL_TEST_DATABASE_URL="$(bun -e '
+  const env = process.env;
+  const url = new URL("postgresql://127.0.0.1");
+  url.hostname = env.POSTGRES_HOST;
+  url.port = env.POSTGRES_PORT;
+  url.pathname = "/" + env.POSTGRES_DB;
+  url.username = env.POSTGRES_USER;
+  url.password = env.POSTGRES_PASSWORD;
+  console.log(url.href);
+')" \
+FINANCIAL_TEST_SQS_ENDPOINT="$(bun -e 'console.log(process.env.SQS_ENDPOINT)')" \
+  bun test
+```
+
+Ao terminar, encerre os quatro processos com Ctrl+C nos respectivos terminais e execute `docker compose -p jungle-eval stop` para parar os serviços preservando o volume.
+
+As decisões, trade-offs e limitações estão em [ARCHITECTURE.md](ARCHITECTURE.md). As evidências de validação e o histórico das correções estão em [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).

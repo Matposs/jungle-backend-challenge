@@ -369,7 +369,7 @@ describe.skipIf(!databaseUrl)('Financial HTTP queries on PostgreSQL', () => {
     expect(await response.json()).toMatchObject({ message: 'Internal server error' });
   });
 
-  test('returns 503 when an established PostgreSQL connection closes without a server error', async () => {
+  test('returns 503 for wallet reads and openings when PostgreSQL disconnects without a server error', async () => {
     const wallet = await open();
     const config = financialTestConfig(databaseUrl!, schema);
     const sockets = new Set<Socket>();
@@ -405,7 +405,8 @@ describe.skipIf(!databaseUrl)('Financial HTTP queries on PostgreSQL', () => {
       const { port } = relay.address() as AddressInfo;
       throughRelay = await createWalletApp({ ...config, host: '127.0.0.1', port });
       await throughRelay.listen(0, '127.0.0.1');
-      const target = `${await throughRelay.getUrl()}/wallets/${wallet.id}`;
+      const baseUrl = await throughRelay.getUrl();
+      const target = `${baseUrl}/wallets/${wallet.id}`;
       const readWallet = () => fetch(target, { signal: AbortSignal.timeout(3000) });
       const before = await readWallet();
       expect(before.status).toBe(200);
@@ -421,6 +422,17 @@ describe.skipIf(!databaseUrl)('Financial HTTP queries on PostgreSQL', () => {
       const recovered = await readWallet();
       expect(recovered.status).toBe(200);
       expect(await recovered.json()).toEqual(wallet);
+
+      const openWallet = () => fetch(`${baseUrl}/wallets`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(3000),
+        body: JSON.stringify({ playerId: 'wallet-opening-eof', initialBalance: { amount: '25.00', currency: 'BRL' } }),
+      });
+      dropNextQuery = true;
+      const interruptedOpening = await openWallet();
+      expect(closedConnections).toBe(2);
+      expect(interruptedOpening.status).toBe(503);
+      expect((await openWallet()).status).toBe(201);
+      expect((await openWallet()).status).toBe(409);
     } finally {
       for (const socket of sockets) socket.destroy();
       await Promise.all([

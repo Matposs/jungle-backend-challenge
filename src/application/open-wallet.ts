@@ -12,7 +12,7 @@ export interface FinancialOpening {
 }
 
 export interface WalletOpeningStore {
-  save(wallet: Wallet, opening?: FinancialOpening): Promise<void>;
+  save(build: (at: Date) => { wallet: Wallet; opening?: FinancialOpening }): Promise<Wallet>;
 }
 
 export class WalletAlreadyExistsError extends Error {
@@ -23,16 +23,18 @@ export class WalletAlreadyExistsError extends Error {
   }
 }
 
+export class WalletOpeningUnavailableError extends Error {}
+
 export class OpenWallet {
   constructor(private readonly store: WalletOpeningStore) {}
 
-  async execute(playerId: string, initialBalance: Money): Promise<Wallet> {
-    const at = new Date();
+  execute(playerId: string, initialBalance: Money): Promise<Wallet> {
+    return this.store.save((at) => this.#build(playerId, initialBalance, at));
+  }
+
+  #build(playerId: string, initialBalance: Money, at: Date): { wallet: Wallet; opening?: FinancialOpening } {
     const wallet = Wallet.open({ id: crypto.randomUUID(), playerId, initialBalance }, at);
-    if (initialBalance.isZero()) {
-      await this.store.save(wallet);
-      return wallet;
-    }
+    if (initialBalance.isZero()) return { wallet };
 
     const openingKey = `opening:${wallet.id}`;
     const kind = WagerTransactionKind.Opening;
@@ -58,7 +60,6 @@ export class OpenWallet {
       }),
     ];
 
-    await this.store.save(wallet, { transaction, entry, events });
-    return wallet;
+    return { wallet, opening: { transaction, entry, events } };
   }
 }
