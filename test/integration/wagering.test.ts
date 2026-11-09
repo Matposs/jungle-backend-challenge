@@ -466,6 +466,45 @@ describe.skipIf(!databaseUrl)('Wagering on PostgreSQL', () => {
     ]);
   });
 
+  test.each([Kind.Refund, Kind.Rollback] as const)('isolates a pending %s reservation between rounds during a compensation race', async (kind) => {
+    const wallet = await open(`cross-round-${kind}`);
+    const reference = `late-cross-round-bet-${kind}`;
+    const compensation = kind === Kind.Refund ? refund : rollback;
+    const wrong = { ...compensation(wallet, `wrong-round-${kind}`, '20.00', reference), roundId: 'wrong-round' };
+    const pending = await submit(wrong);
+    expect(pending.status).toBe(202);
+    const { transactionId: pendingId } = await pending.json() as BetResponse;
+
+    const source = await submit(bet(wallet, reference, '20.00'), reference, 1);
+    expect(source.status).toBe(200);
+    const { transactionId: referenceId } = await source.json() as BetResponse;
+    const commands = [0, 1].map((index) => compensation(wallet, `right-round-${kind}-${index}`, '20.00', reference));
+    const responses = await Promise.all(commands.map((body, index) => submit(body, body.externalTransactionId, index + 1)));
+    const results = await Promise.all(responses.map(async (response) => ({ status: response.status, body: await response.json() as BetResponse })));
+    expect(results).toContainEqual({ status: 200, body: expect.objectContaining({ status: Status.Processed }) });
+    expect(results).toContainEqual({ status: 409, body: expect.objectContaining({ failureCode: `DUPLICATE_${kind}` }) });
+
+    const before = await state(wallet.id, kind);
+    expect(before.wallet).toMatchObject({ balance: '100.00', version: 3 });
+    expect(before.entries).toHaveLength(3);
+    expect(before.transactions).toHaveLength(2);
+    expect(before.transactions).toContainEqual(expect.objectContaining({ status: Status.Processed, referenceTransactionId: referenceId }));
+    expect(before.transactions).toContainEqual(expect.objectContaining({ id: pendingId, status: Status.PendingReference }));
+
+    const otherPending = await orm.em.fork().find(WagerTransactionRecord, {
+      id: { $ne: pendingId }, status: Status.PendingReference,
+    });
+    expect(await new PostgresWagerStore(orm.em).processNextPendingReference(otherPending.map(({ id }) => id))).toBe(true);
+    const after = await state(wallet.id, kind);
+    expect(after.transactions).toContainEqual(expect.objectContaining({
+      id: pendingId, status: Status.Rejected, failureCode: 'INVALID_REFERENCE',
+    }));
+    expect(after.wallet).toEqual(before.wallet);
+    expect(after.entries).toEqual(before.entries);
+    expect(after.wagerEvents.filter(({ aggregateId }) => aggregateId === pendingId).map(({ eventType }) => eventType).sort())
+      .toEqual(['WagerTransactionPendingReference', 'WagerTransactionRejected']);
+  });
+
   test('reserves a missing or pending BET reference and keeps its REFUND pending after the BET arrives', async () => {
     const wallet = await open('refund-pending');
     const missing = refund(wallet, 'refund-missing-bet', '20.00', 'late-refund-bet');

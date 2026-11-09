@@ -14,7 +14,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 | --- | --- |
 | [`src/domain`](../src/domain) | `Money`, `Wallet`, `WalletLedgerEntry`, `WagerTransaction` e envelopes de integração versionados |
 | [`src/application`](../src/application) | `OpenWallet`, `SubmitWager` e validação de entrada compartilhada |
-| [`src/infrastructure/database`](../src/infrastructure/database) | Transações, mapeadores, registros, seis migrations explícitas e worker de referências |
+| [`src/infrastructure/database`](../src/infrastructure/database) | Transações, mapeadores, registros, sete migrations explícitas e worker de referências |
 | [`src/infrastructure/http`](../src/infrastructure/http) | Controllers e composição NestJS da API |
 | [`src/infrastructure/sqs`](../src/infrastructure/sqs) | Consumidor e publicador, com pontos de entrada independentes |
 | [`infra/localstack`](../infra/localstack) e [`test`](../test) | Provisionamento local das filas e testes de domínio, HTTP e integração |
@@ -45,7 +45,7 @@ O projeto é um monólito modular em Bun 1.x, NestJS e TypeScript strict. O buil
 ## Fluxos e garantias atuais
 
 - **HTTP.** `POST /wallets` abre a wallet. `POST /wagering/transactions` exige `Idempotency-Key` e distingue entrada inválida, conflito, rejeição de negócio, referência pendente e indisponibilidade. `GET /health/live` verifica a API. `OPENING` só é criado internamente.
-- **Transação financeira.** `PostgresWagerStore` usa `SELECT … FOR UPDATE` na wallet e persiste decisão, saldo, ledger e Outbox no mesmo commit. Wallets diferentes podem progredir em paralelo. O índice reserva estornos por provedor, wallet, referência externa e tipo. A proteção entre `REFUND` e `ROLLBACK` é avaliada sob o lock da wallet. O trigger do ledger impede `UPDATE`, `DELETE` e `TRUNCATE`.
+- **Transação financeira.** `PostgresWagerStore` usa `SELECT … FOR UPDATE` na wallet e persiste decisão, saldo, ledger e Outbox no mesmo commit. Wallets diferentes podem progredir em paralelo. O índice reserva estornos por provedor, wallet, rodada, referência externa e tipo. A proteção entre `REFUND` e `ROLLBACK` é avaliada sob o lock da wallet. O trigger do ledger impede `UPDATE`, `DELETE` e `TRUNCATE`.
 - **Replay.** O provedor delimita a unicidade da chave e do ID externo. O hash SHA-256 canônico dos campos de negócio detecta divergência entre HTTP e SQS. A operação gravada fornece o resultado e o saldo originalmente observado quando aplicável. O algoritmo e a política de compensação estão no `ARCHITECTURE.md`.
 - **SQS e Inbox.** `wager-transactions.fifo` usa redrive para `wager-transactions-dlq.fifo` após cinco recebimentos. O consumidor reutiliza `SubmitWager`. A chave `(consumer_name, message_id)`, o hash do envelope e a conclusão ficam na mesma transação dos efeitos. O ACK ocorre depois do commit, inclusive para rejeições persistidas e referências pendentes. Falhas transitórias usam backoff de visibilidade e falhas permanentes seguem para a DLQ.
 - **Outbox.** O publicador lê eventos confirmados com `FOR UPDATE SKIP LOCKED`, seleciona o primeiro evento por agregado e publica o envelope em `wagering-events.fifo`. São emitidos `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference` e `WalletBalanceChanged` conforme o resultado. O publicador grava sucesso após o ACK do broker e persiste os retries. `aggregateId` ordena o grupo e `eventId` é estável para deduplicação.
@@ -111,6 +111,14 @@ A validação usou uma cópia dos arquivos atuais, incluindo as alterações loc
 Os quatro processos iniciaram pelos comandos do `package.json`. Liveness, readiness e métricas da API e dos três workers responderam com sucesso. A aposta HTTP de `25.00 BRL` sobre `100.00 BRL` retornou `PROCESSED`. O saldo e o ledger reconciliaram em `75.00 BRL` com dois lançamentos e diferença zero. No caminho SQS, um `REFUND` chegou antes da `BET`, ficou pendente e foi resolvido pelo worker quando a referência apareceu. A reconciliação final manteve `75.00 BRL` com quatro lançamentos. A Outbox registrou nove publicações confirmadas. Os dois eventos da aposta HTTP foram lidos na fila de saída.
 
 O comando da suíte completa do roteiro aprovou 188 testes em 16 arquivos, com zero falhas. `bun run typecheck`, `bun run build` e `git diff --check` passaram. O checkout original foi conferido com `git status --short`.
+
+## Isolamento de reservas entre rodadas
+
+Antes da correção, uma reserva pendente de outra rodada na mesma wallet fez as duas tentativas concorrentes retornarem `409`, para `REFUND` e para `ROLLBACK`. O `REFUND` legítimo via SQS chegou à DLQ como `DUPLICATE_REFUND`.
+
+A migration `RoundScopedReversalReservations` inclui a rodada no índice. A tentativa legítima confirma uma única compensação, a duplicata recebe `409` e o worker rejeita a pendência incompatível com `INVALID_REFERENCE`. O consumidor confirma o `REFUND` válido sem enviá-lo à DLQ. O procedimento de setup permanece válido. `bun run migration:status` agora mostra sete migrations aplicadas e nenhuma pendente após o `up`.
+
+Os três cenários falharam antes da correção. Depois, passaram 77 testes focados e 192 na suíte completa com PostgreSQL e LocalStack, com zero falhas. A migration foi revertida e reaplicada em banco isolado. O teste de schema confirma que um `down` incompatível com os dados preserva o índice e as reservas. `bun run typecheck`, `bun run build` e `git diff --check` passaram.
 
 ## Limitações operacionais
 

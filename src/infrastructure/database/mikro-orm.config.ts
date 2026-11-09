@@ -7,6 +7,7 @@ import { Migration20261107000300_TransactionalInbox } from './migrations/Migrati
 import { Migration20261107000400_OutboxPublication } from './migrations/Migration20261107000400_OutboxPublication.js';
 import { Migration20261107000500_WagerImmutability } from './migrations/Migration20261107000500_WagerImmutability.js';
 import { Migration20261107000600_WalletScopedReversalReservations } from './migrations/Migration20261107000600_WalletScopedReversalReservations.js';
+import { Migration20261107000700_RoundScopedReversalReservations } from './migrations/Migration20261107000700_RoundScopedReversalReservations.js';
 import { InboxRecord } from './inbox-record.js';
 import { OutboxRecord } from './outbox-record.js';
 
@@ -24,6 +25,7 @@ export const postgresConfig = defineConfig({
       Migration20261107000100_FinancialSchema, Migration20261107000200_TransactionalOutbox,
       Migration20261107000300_TransactionalInbox, Migration20261107000400_OutboxPublication,
       Migration20261107000500_WagerImmutability, Migration20261107000600_WalletScopedReversalReservations,
+      Migration20261107000700_RoundScopedReversalReservations,
     ],
     transactional: true,
     disableForeignKeys: false,

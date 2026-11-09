@@ -321,6 +321,8 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
     expect((await http(source)).status).toBe(200);
 
     const migration = 'Migration20261107000600_WalletScopedReversalReservations';
+    const roundMigration = 'Migration20261107000700_RoundScopedReversalReservations';
+    expect((await orm.migrator.down()).map(({ name }) => name)).toEqual([roundMigration]);
     expect((await orm.migrator.down({ migrations: [migration] })).map(({ name }) => name)).toEqual([migration]);
     const legacy = start();
     let body: string;
@@ -336,7 +338,7 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
       expect((await snapshot(owner.id)).wallet).toMatchObject({ balance: '80.00', version: 2 });
     } finally {
       await legacy.close();
-      expect((await orm.migrator.up({ migrations: [migration] })).map(({ name }) => name)).toEqual([migration]);
+      expect((await orm.migrator.up()).map(({ name }) => name)).toEqual([migration, roundMigration]);
     }
 
     const brokenAck = testSqs();
@@ -374,6 +376,38 @@ describe.skipIf(!databaseUrl || !endpoint)('Wager consumer on PostgreSQL and Loc
       const dead = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlq, WaitTimeSeconds: 1 }));
       expect(dead.Messages ?? []).toEqual([]);
     } finally { await retry.close(); }
+  }, 15_000);
+
+  test('ACKs a legitimate REFUND despite a pending reservation in another round', async () => {
+    const wallet = await open('sqs-cross-round');
+    const source = envelope(wallet, 'sqs-cross-round-bet');
+    const wrong = envelope(wallet, 'sqs-cross-round-wrong', 'REFUND', '20.00', source.data.externalTransactionId);
+    wrong.data.roundId = 'wrong-round';
+    const valid = envelope(wallet, 'sqs-cross-round-valid', 'REFUND', '20.00', source.data.externalTransactionId);
+    expect((await http(wrong)).status).toBe(202);
+    expect((await http(source)).status).toBe(200);
+
+    const worker = start();
+    try {
+      await send(valid);
+      const outcome = await until(() => worker.logs.find((entry) =>
+        entry.event === 'sqs_ack' || entry.event === 'sqs_permanent_failure'));
+      if (outcome.event === 'sqs_permanent_failure') {
+        expect((await readDlq()).Body).toBe(JSON.stringify(valid));
+        expect(await inbox(valid.messageId)).toBeNull();
+      }
+      expect(outcome).toMatchObject({ event: 'sqs_ack', status: 'PROCESSED', duplicate: false, messageId: valid.messageId });
+      expect(await inbox(valid.messageId)).toMatchObject({ processedAt: expect.any(Date) });
+      const result = await snapshot(wallet.id);
+      expect(result.wallet).toMatchObject({ balance: '100.00', version: 3 });
+      expect(result.wagers).toContainEqual(expect.objectContaining({
+        externalTransactionId: wrong.data.externalTransactionId, status: 'PENDING_REFERENCE',
+      }));
+      expect(result.ledger).toHaveLength(3);
+      expect(result.events).toHaveLength(7);
+      const dead = await sqs.send(new ReceiveMessageCommand({ QueueUrl: dlq, WaitTimeSeconds: 1 }));
+      expect(dead.Messages ?? []).toEqual([]);
+    } finally { await worker.close(); }
   }, 15_000);
 
   test('rolls back Inbox and all effects when PostgreSQL fails at commit, then processes on redelivery', async () => {
